@@ -1,0 +1,29 @@
+[package]
+name = "urma-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust bindings for URMA (Unified Remote Memory Access)"
+license = "MIT"
+
+[lib]
+name = "urma_rs"
+path = "src/lib.rs"
+
+# Examples under examples/ are auto-discovered by cargo
+# (cargo run --example <name> -- <args>); examples/common/ is a utility module
+# pulled in via #[path], not an example itself.
+
+# The library has zero third-party dependencies: src/ffi.rs is a hand-written
+# bindings file (layout guarded by unit tests inside ffi.rs) that links the
+# system library liburma.so.
+[dependencies]
+
+# The examples' HTTP control plane (axum + tokio) and CLI parsing (clap derive)
+# — dev-dependencies only, keeping the library itself dependency-free.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+clap = { version = "4", features = ["derive"] }

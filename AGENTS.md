@@ -13,6 +13,8 @@ plus example demos.
   SEND/RECV), `urma_lookup` (P2P directory), `list_devices` (probe tool);
   shared helpers in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
+- `docs/urma.md` — URMA background concepts (resource model, transport
+  parameter rules, CTP-RM rationale).
 
 ## Commands
 
@@ -24,7 +26,9 @@ cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
-./scripts/test_ub.sh        # real-device tests; SKIPs when no device
+./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
+                            # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),
+                            # SKIPs when unset (UB has no loopback)
 ```
 
 ## Layer rules
@@ -52,6 +56,18 @@ cargo clippy --examples
 
 ## Domain facts
 
+- All use cases run **CTP-RM**: `trans_mode = URMA_TM_RM` (reliable message,
+  multi-path) + `tp_type = URMA_CTP` (Compact Transport; UB protocol TP types
+  are RTP/CTP/UTP). `tp_type` is NOT a create-time parameter — `urma_jfs_cfg_t`
+  /`urma_jfr_cfg_t` have no such field; it is chosen by the importer in
+  `urma_rjetty_t.tp_type` at `urma_import_jetty` (single site:
+  `Peer::import` in `src/urma.rs`). RM + CTP + default order_type (0) is an
+  allowed combination per umdk's URMA API Guide §1.2 (RM+CTP+NO is blocked,
+  RM is reliable); CTP additionally requires device support
+  (`urma_device_feature.ctp_en` / `rm_tp_cap.ctp`). See `docs/urma.md` for
+  the full background; references:
+  `/root/openEuler/umdk/doc/ch/urma/URMA API Guide.ch.md`,
+  `/root/openEuler/umdk/src/urma/examples/urma_sample.c` (`-t 1` = CTP).
 - The token-id (protection table) mechanism is intentionally disabled:
   `token_policy`/`token_id_valid` are all 0; authentication is only the plain
   `token_value` agreed by both peers (`TOKEN_VALUE = 0xACFE`). The driver still
@@ -74,8 +90,8 @@ cargo clippy --examples
   (observed on bonding_dev_0). The examples guard it via
   `common::check_loopback` and fail with a clean message; real UB-mode e2e
   needs two machines. Note `urma_sample` only allows loopback on bonding
-  devices with RC + single-path; our examples are RM + multi-path, which is
-  the sanctioned two-node combination.
+  devices with RC + single-path; our examples are CTP-RM + multi-path, which
+  is the sanctioned two-node combination.
 - The bonding provider (liburma_ubagg) snapshots the fabric topology once per
   process — at the first `urma_create_context` (`get_topo_info_from_ko`) — and
   never refreshes it. `urma_import_jetty` picks paths from that snapshot

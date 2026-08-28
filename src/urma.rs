@@ -425,7 +425,8 @@ pub struct Jetty {
 }
 
 impl Jetty {
-    /// Fixed RM transport mode + RTP (order_type uses default 0)
+    /// Fixed RM transport mode (order_type uses default 0); the tp_type
+    /// (CTP) is only chosen later, at import time — see Peer::import
     pub fn new(ctx: &Context, cq: &CompletionQueue, opts: JettyOpts) -> Result<Self> {
         /* jfr: one-sided READ never receives data through it, but jetty is created with share_jfr, so it must be created first */
         let mut jfr_cfg = ffi::urma_jfr_cfg_t {
@@ -723,7 +724,7 @@ impl Peer {
             trans_mode: ffi::URMA_TM_RM,
             policy: ffi::URMA_JETTY_GRP_POLICY_RR,
             type_: ffi::URMA_TARGET_JETTY,
-            tp_type: ffi::URMA_TP_RTP,
+            tp_type: ffi::URMA_TP_CTP, /* CTP-RM; tp_type is chosen at import, not at create */
             ..Default::default()
         };
 

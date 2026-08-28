@@ -18,7 +18,8 @@ plus example demos.
 
 ```bash
 cargo build --examples      # lib + examples (linking needs liburma.so)
-cargo test                  # 4 ffi layout guard tests (sizes/offsets/flags)
+cargo test                  # 6 guard tests (4 ffi ABI layout + Urma::init
+                            # idempotence + URMA_LOG_LEVEL mapping)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
@@ -53,7 +54,51 @@ cargo clippy --examples
 
 - The token-id (protection table) mechanism is intentionally disabled:
   `token_policy`/`token_id_valid` are all 0; authentication is only the plain
-  `token_value` agreed by both peers (`TOKEN_VALUE = 0xACFE`).
+  `token_value` agreed by both peers (`TOKEN_VALUE = 0xACFE`). The driver still
+  allocates a token id at register (a kernel bitmap id on bonding devices: 0
+  only for the first-ever registration), and it is the KEY of the import
+  exchange: the importer's kernel sends it to the remote, which resolves the
+  segment by it (`ubagg_connect.c handle_seg_req`), so `descriptor()` must
+  ship `seg.token_id` as-is (publishing a hardcoded 0 makes import fail — or
+  resolve a wrong seg — whenever the peer's allocation isn't 0). Unlike
+  token_id, `attr`'s has_user_info bit (ext data we never ship) must be masked
+  off before publishing.
+- `urma_init` is once-per-process in the C library (second call returns
+  `URMA_EEXIST`); `Urma::init` caches the guard per thread so several resource
+  sets per process work, and `urma_uninit` runs once, at thread teardown.
+  `urma_hello` still uses a single shared `UrmaRes` per process (halves device
+  resources); `urma_pingpong` keeps per-role sets (echo needs `&mut` buffer
+  access, and one jetty would mix both roles' recv buffers).
+- Single-machine loopback (both "nodes" on one device: same EID, uasid 0)
+  core-dumps inside liburma's import path instead of returning an error
+  (observed on bonding_dev_0). The examples guard it via
+  `common::check_loopback` and fail with a clean message; real UB-mode e2e
+  needs two machines. Note `urma_sample` only allows loopback on bonding
+  devices with RC + single-path; our examples are RM + multi-path, which is
+  the sanctioned two-node combination.
+- The bonding provider (liburma_ubagg) snapshots the fabric topology once per
+  process — at the first `urma_create_context` (`get_topo_info_from_ko`) — and
+  never refreshes it. `urma_import_jetty` picks paths from that snapshot
+  (`bondp_rebuild_connected_by_topo` overwrites the kernel matrix), while
+  `urma_import_seg` uses the kernel's live matrix, so a process started before
+  the peer node's links were up fails import_jetty with "Failed to find
+  connected port" (NULL, errno 115) even though the seg import succeeded.
+  Restarting the process once the peer is up takes a fresh snapshot and fixes
+  it. Hence `urma_hello` creates its `UrmaRes` only after the peer answers
+  (`ensure_resources`; `GET /info` returns 503 until then) and bounds the
+  server's bye wait (`BYE_TIMEOUT` + `POST /abort`) so a dead peer cannot hang
+  the survivor — HTTP, unlike TCP, gives no EOF signal.
+  The snapshot can only be deferred by time, never by events (both sides
+  gating on the peer's 200 would deadlock): `HELLO_RES_DELAY_MS=<n>` holds
+  resource creation back n ms after the peer first answers, as an experiment
+  knob for the import-time SIGSEGV.
+- liburma's default log sink is syslog, so provider/driver errors never reach
+  the terminal. The examples call `urma_rs::enable_stderr_log_from_env()`
+  before creating resources to mirror `[urma:N] ...` lines to stderr.
+  `URMA_LOG_LEVEL` is the switch: `off` keeps the default syslog sink (quiet
+  terminal), `0`-`7` picks a `URMA_VLOG_LEVEL_*`, and unset/invalid keeps the
+  DEBUG default. NULL-returning FFI calls capture errno into
+  `Error::Null(what, errno)` at the failure site.
 - `PageBuf` keeps 4KB alignment as cheap insurance (not required by the plain
   register path); use the `PAGE_SIZE` const, never a magic 4096.
 

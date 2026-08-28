@@ -240,3 +240,21 @@ pub fn res_opt(tcp_hook: bool, role: &str, dev: &str, msg: &[u8]) -> Result<Opti
         UrmaRes::create(role, dev, msg).map(Some)
     }
 }
+
+/// Single-machine loopback guard: when both "nodes" run on one machine they
+/// share the device (same EID, uasid 0), and the current urma library crashes
+/// with a core dump inside the import path instead of returning an error
+/// (observed on bonding_dev_0). Fail cleanly and point at two-node mode.
+/// Only meaningful with real descriptors — never call it on hook-mode descs
+/// (those are all-zero and would compare equal).
+pub fn check_loopback(my: &PeerDesc, peer: &PeerDesc) -> Result<()> {
+    if my.eid == peer.eid {
+        return Err(Error::Invalid(
+            "peer EID equals the local EID (single-machine loopback): this urma \
+             library/driver build core-dumps on self-import; run the two nodes \
+             on separate machines instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}

@@ -31,14 +31,17 @@ use tokio::sync::{watch, Barrier};
 
 use urma_rs::error::{Error, Result};
 use urma_rs::{
-    CompletionQueue, Context, Jetty, JettyOpts, Peer, RegisteredBuf, Urma, DEFAULT_DEPTH,
-    PAGE_SIZE, TOKEN_VALUE,
+    enable_stderr_log_from_env, CompletionQueue, Context, Jetty, JettyOpts, Peer, RegisteredBuf,
+    Urma, DEFAULT_DEPTH, PAGE_SIZE, TOKEN_VALUE,
 };
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{cstr_len, default_name, http_err, json_retry, report, send_retry, PeerDesc, MSG_SIZE};
+use common::{
+    cstr_len, check_loopback, default_name, http_err, json_retry, report, send_retry, PeerDesc,
+    MSG_SIZE,
+};
 
 /* ============================== Constants and memory layout ============================== */
 
@@ -170,6 +173,7 @@ impl Transport for UrmaTransport {
     }
 
     fn import(&mut self, idx: usize, o: &OwnerInfo) -> Result<()> {
+        check_loopback(&self.desc(), &o.desc)?;
         if self.peers.len() <= idx {
             self.peers.resize_with(idx + 1, || None);
         }
@@ -617,6 +621,11 @@ async fn main() -> ExitCode {
             run_client(&cfg, &http, &mut tr).await
         } else {
             let dev = args.dev_name.clone().expect("validated by Args::validate");
+            /* provider/driver errors otherwise go to syslog only; URMA_LOG_LEVEL
+               is the switch (off / 0-7, default DEBUG) */
+            if let Err(e) = enable_stderr_log_from_env() {
+                return report(Err(e));
+            }
             match UrmaTransport::new(&dev) {
                 Ok(mut tr) => run_client(&cfg, &http, &mut tr).await,
                 Err(e) => Err(e),

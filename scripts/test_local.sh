@@ -3,25 +3,14 @@
 # verify all processes exit 0 and every client fetched all foreign records
 # with the expected content.
 # Usage: ./scripts/test_local.sh [client count (default 3, max 8)] [records per client (default 2)]
-# Modes (MODE env var): hook (default, no device) | ub (real URMA, needs DEV=<name>)
+# tcp-hook mode (no device needed); real-device runs are two-machine only,
+# see test_ub.sh.
 set -u
 cd "$(dirname "$0")/.."
 
 # clear proxy env vars so 127.0.0.1 requests do not go through an external proxy
 unset http_proxy https_proxy all_proxy no_proxy \
       HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY 2>/dev/null || true
-
-MODE=${MODE:-hook}
-case "$MODE" in
-    hook) CLIENT_MODE_ARGS=(--tcp-hook) ;;
-    ub)
-        if [ -z "${DEV:-}" ]; then
-            echo "MODE=ub requires DEV=<device name> (run the list_devices example)" >&2
-            exit 1
-        fi
-        CLIENT_MODE_ARGS=(-d "$DEV") ;;
-    *) echo "MODE must be hook or ub" >&2; exit 1 ;;
-esac
 
 BIN=./target/debug/examples/urma_lookup
 N=${1:-3}
@@ -36,17 +25,20 @@ fi
 cargo build --examples || exit 1
 
 LOGDIR=$(mktemp -d /tmp/urma_rs_test.XXXXXX)
+echo "node logs: $LOGDIR (master.log + one nodeX.log per client)"
 cleanup() { rm -rf "$LOGDIR"; }
 trap cleanup EXIT
 
-"$BIN" --master --clients "$N" --port "$PORT" >"$LOGDIR/master.log" 2>&1 &
+# TMO: per-node timeout in seconds (default 60); a node killed by timeout or
+# exiting nonzero gets its log tails printed below
+timeout -k 5 "${TMO:-60}" "$BIN" --master --clients "$N" --port "$PORT" >"$LOGDIR/master.log" 2>&1 &
 MPID=$!
 sleep 0.3
 
 PIDS=()
 for ((i = 0; i < N; i++)); do
-    "$BIN" "${CLIENT_MODE_ARGS[@]}" -m 127.0.0.1 --port "$PORT" --name "${NAMES[$i]}" --records "$R" \
-        >"$LOGDIR/${NAMES[$i]}.log" 2>&1 &
+    timeout -k 5 "${TMO:-60}" "$BIN" --tcp-hook -m 127.0.0.1 --port "$PORT" --name "${NAMES[$i]}" \
+        --records "$R" >"$LOGDIR/${NAMES[$i]}.log" 2>&1 &
     PIDS+=($!)
 done
 
@@ -55,6 +47,10 @@ for pid in "${PIDS[@]}"; do
     wait "$pid" || FAIL=1
 done
 wait "$MPID" || FAIL=1
+
+if [ "$FAIL" -ne 0 ]; then
+    tail -n 10 "$LOGDIR"/*.log
+fi
 
 # Parse the range actually assigned by master from each client log
 # (accept order is arbitrary, do not assume it)
@@ -99,7 +95,7 @@ for ((rid = 0; rid < total; rid++)); do
 done
 
 if [ "$FAIL" -eq 0 ]; then
-    echo "PASS: $N clients x $R records, all foreign records fetched with correct content (${MODE:-hook})"
+    echo "PASS: $N clients x $R records, all foreign records fetched with correct content (tcp-hook)"
 else
     echo "FAIL: logs kept in $LOGDIR (rerun to regenerate)"
     trap - EXIT

@@ -10,6 +10,7 @@
 //! cheap cloneable handles (like dup'd fds), not unique owners.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::fmt;
 use std::marker::PhantomData;
@@ -19,6 +20,61 @@ use std::time::Duration;
 
 use crate::error::{check_status, Error, Result};
 use crate::ffi;
+
+/// NULL-returning FFI call failed: capture errno immediately, before any
+/// cleanup call can clobber it (0 when the C library does not set one)
+fn null_err(what: &'static str) -> Error {
+    Error::Null(what, std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// Route urma library logs (core + all providers) to stderr. The default sink
+/// is syslog, which hides provider/driver errors from the terminal; call this
+/// before creating resources. `level` is one of the `ffi::URMA_VLOG_LEVEL_*`
+/// values — DEBUG surfaces the import-path details (which port pair failed,
+/// ioctl errno, topology lookups).
+pub fn enable_stderr_log(level: i32) -> Result<()> {
+    unsafe extern "C" fn log_cb(level: i32, message: *mut std::os::raw::c_char) {
+        if message.is_null() {
+            return;
+        }
+        let msg = unsafe { std::ffi::CStr::from_ptr(message) };
+        eprintln!("[urma:{level}] {}", msg.to_string_lossy());
+    }
+    unsafe {
+        ffi::urma_log_set_level(level);
+        check_status(ffi::urma_register_log_func(Some(log_cb)), "urma_register_log_func")
+    }
+}
+
+/// [`enable_stderr_log`] with the `URMA_LOG_LEVEL` env var as the switch, so a
+/// quiet run needs no code change: `off` (case-insensitive) keeps the library
+/// on its default syslog sink, `0`-`7` picks a `URMA_VLOG_LEVEL_*` mirror
+/// level, and unset, unparsable or out-of-range values keep the historical
+/// DEBUG default (losing real-device errors hurts more than extra noise).
+pub fn enable_stderr_log_from_env() -> Result<()> {
+    match stderr_level(std::env::var_os("URMA_LOG_LEVEL").as_deref()) {
+        None => Ok(()),
+        Some(level) => enable_stderr_log(level),
+    }
+}
+
+/// Resolve the env var's value to a mirror level; `None` = no stderr mirror.
+/// Takes the value instead of reading the env itself so tests can exercise
+/// the mapping without touching process state.
+fn stderr_level(value: Option<&std::ffi::OsStr>) -> Option<i32> {
+    let v = match value {
+        None => return Some(ffi::URMA_VLOG_LEVEL_DEBUG),
+        Some(v) => v.to_string_lossy(),
+    };
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match v.parse::<i32>() {
+        Ok(level) if (0..=7).contains(&level) => Some(level),
+        _ => Some(ffi::URMA_VLOG_LEVEL_DEBUG),
+    }
+}
 
 /// Plain token value agreed by both ends (security credential); this is the
 /// `urma_token_t` value, unrelated to the token-id mechanism (which stays
@@ -93,6 +149,8 @@ pub struct SegDesc {
     /// Raw `urma_seg_attr_t` value: opaque to users, round-tripped to
     /// `Peer::import` together with the descriptor
     pub attr: u32,
+    /// Driver-allocated id from the remote's register; the import exchange
+    /// resolves the segment by it, so it travels with the descriptor as-is
     pub token_id: u32,
 }
 
@@ -109,22 +167,40 @@ impl Drop for UrmaInner {
     }
 }
 
-/// Global init guard: maps `Urma::init()`..Drop to `urma_init`/`urma_uninit`.
-/// Create once per process. Every [`Context`] created from this guard keeps it
-/// alive internally, so `urma_uninit` always runs after the last context is
-/// deleted, wherever the guard itself is dropped.
+/// Global init guard: maps the first `Urma::init()`..last-drop to
+/// `urma_init`/`urma_uninit`. Later `init()` calls on the same thread clone the
+/// cached guard (see [`Urma::init`]). Every [`Context`] created from a guard
+/// keeps it alive internally, so `urma_uninit` always runs after the last
+/// context is deleted, wherever the guard itself is dropped.
 pub struct Urma {
     inner: Rc<UrmaInner>,
 }
 
 impl Urma {
+    /// `urma_init` may only run once per process: the C library returns
+    /// URMA_EEXIST on a second call. To keep the guard ergonomic (and role-
+    /// separated resource sets, as in the examples, working), a successful
+    /// initialization is cached per thread and later calls clone it;
+    /// `urma_uninit` runs once, when the thread's initialization goes away.
+    /// Per-thread caching matches the crate's design: resources are !Send and
+    /// stay on the thread that created them.
     pub fn init() -> Result<Self> {
-        let mut attr = ffi::urma_init_attr_t {
-            token: 0,
-            uasid: 0, /* 0 means assigned by the system */
-        };
-        check_status(unsafe { ffi::urma_init(&mut attr) }, "urma_init")?;
-        Ok(Urma { inner: Rc::new(UrmaInner) })
+        thread_local! {
+            static INIT: RefCell<Option<Rc<UrmaInner>>> = const { RefCell::new(None) };
+        }
+        INIT.with(|slot| {
+            if let Some(inner) = slot.borrow().clone() {
+                return Ok(Urma { inner });
+            }
+            let mut attr = ffi::urma_init_attr_t {
+                token: 0,
+                uasid: 0, /* 0 means assigned by the system */
+            };
+            check_status(unsafe { ffi::urma_init(&mut attr) }, "urma_init")?;
+            let inner = Rc::new(UrmaInner);
+            *slot.borrow_mut() = Some(Rc::clone(&inner));
+            Ok(Urma { inner })
+        })
     }
 }
 
@@ -206,7 +282,7 @@ impl Context {
         unsafe { ffi::urma_free_eid_list(list) };
 
         let raw = unsafe { ffi::urma_create_context(dev, info.eid_index) };
-        let raw = NonNull::new(raw).ok_or(Error::Null("urma_create_context"))?;
+        let raw = NonNull::new(raw).ok_or_else(|| null_err("urma_create_context"))?;
         Ok(Context {
             inner: Rc::new(ContextInner { raw, _urma: Rc::clone(&urma.inner) }),
             eid,
@@ -265,7 +341,7 @@ pub struct CompletionQueue {
 impl CompletionQueue {
     pub fn new(ctx: &Context, depth: u32) -> Result<Self> {
         let jfce = unsafe { ffi::urma_create_jfce(ctx.raw()) };
-        let jfce = NonNull::new(jfce).ok_or(Error::Null("urma_create_jfce"))?;
+        let jfce = NonNull::new(jfce).ok_or_else(|| null_err("urma_create_jfce"))?;
         let mut cfg = ffi::urma_jfc_cfg_t {
             depth,
             jfce: jfce.as_ptr(), /* jfce is a required field in urma_jfc_cfg_t */
@@ -274,7 +350,7 @@ impl CompletionQueue {
         let jfc = unsafe { ffi::urma_create_jfc(ctx.raw(), &mut cfg) };
         let Some(jfc) = NonNull::new(jfc) else {
             unsafe { ffi::urma_delete_jfce(jfce.as_ptr()) };
-            return Err(Error::Null("urma_create_jfc"));
+            return Err(null_err("urma_create_jfc"));
         };
         Ok(CompletionQueue { inner: Rc::new(CqInner { jfce, jfc, _ctx: ctx.clone() }) })
     }
@@ -363,7 +439,7 @@ impl Jetty {
             ..Default::default() /* id = 0 means assigned by the system */
         };
         let jfr = unsafe { ffi::urma_create_jfr(ctx.raw(), &mut jfr_cfg) };
-        let jfr = NonNull::new(jfr).ok_or(Error::Null("urma_create_jfr"))?;
+        let jfr = NonNull::new(jfr).ok_or_else(|| null_err("urma_create_jfr"))?;
 
         let jfs_flag = ffi::urma_jfs_flag_t::default()
             .with_order_type(0)
@@ -390,8 +466,9 @@ impl Jetty {
 
         let raw = unsafe { ffi::urma_create_jetty(ctx.raw(), &mut jetty_cfg) };
         let Some(raw) = NonNull::new(raw) else {
+            let e = null_err("urma_create_jetty");
             unsafe { ffi::urma_delete_jfr(jfr.as_ptr()) };
-            return Err(Error::Null("urma_create_jetty"));
+            return Err(e);
         };
         let id = JettyId::from_raw(unsafe { &raw.as_ref().jetty_id });
         Ok(Jetty { jfr, raw, id, max_sge: opts.max_sge, _cq: cq.clone() })
@@ -536,10 +613,11 @@ pub struct RegisteredSeg<B = ()> {
 }
 
 impl RegisteredSeg<()> {
-    /// Grant the peer READ|WRITE; the token-id mechanism stays disabled (no
-    /// token id is ever allocated): token_policy/cacheable/token_id_valid are
-    /// all 0, only the access field is set, and authentication relies on the
-    /// plain `token_value` alone
+    /// Grant the peer READ|WRITE; no user token id is requested:
+    /// token_policy/cacheable/token_id_valid are all 0, only the access field
+    /// is set, and authentication relies on the plain `token_value` alone.
+    /// (The driver still allocates an internal token id at register —
+    /// `descriptor()` must ship it for the peer's import to resolve.)
     pub fn register(ctx: &Context, ptr: *mut u8, len: usize, token_value: u32) -> Result<Self> {
         Self::register_in(ctx, ptr, len, token_value, ())
     }
@@ -567,7 +645,7 @@ impl<B> RegisteredSeg<B> {
         };
 
         let tseg = unsafe { ffi::urma_register_seg(ctx.raw(), &mut cfg) };
-        let tseg = NonNull::new(tseg).ok_or(Error::Null("urma_register_seg"))?;
+        let tseg = NonNull::new(tseg).ok_or_else(|| null_err("urma_register_seg"))?;
         Ok(RegisteredSeg { tseg, va: ptr as u64, len: len as u64, _ctx: ctx.clone(), buf })
     }
 
@@ -578,8 +656,18 @@ impl<B> RegisteredSeg<B> {
             eid: Eid(seg.ubva.eid),
             uasid: seg.ubva.uasid,
             va: seg.ubva.va(),
+            // has_user_info (bit 14) would promise extension data appended
+            // after urma_seg_t; a descriptor crossing the wire as plain values
+            // never carries that payload, so the bit must not travel (the
+            // bonding provider would parse nonexistent trailing bytes).
+            attr: seg.attr.value & !(1 << 14),
             len: seg.len,
-            attr: seg.attr.value,
+            // token_id is allocated by the driver at register (a kernel
+            // bitmap id on bonding, 0 only for the first-ever registration)
+            // and is the key of the import exchange: the importer's kernel
+            // sends it back and the REMOTE looks the segment up by it
+            // (ubagg_connect.c handle_seg_req). It must travel as-is, exactly
+            // like the official sample ships tseg->seg.token_id.
             token_id: seg.token_id,
         }
     }
@@ -628,7 +716,7 @@ impl Peer {
         let tseg = unsafe {
             ffi::urma_import_seg(ctx.raw(), &mut seg_in, &mut token, 0, imp_flag)
         };
-        let tseg = NonNull::new(tseg).ok_or(Error::Null("urma_import_seg"))?;
+        let tseg = NonNull::new(tseg).ok_or_else(|| null_err("urma_import_seg"))?;
 
         let mut rjetty = ffi::urma_rjetty_t {
             jetty_id: jetty.to_raw(),
@@ -642,8 +730,9 @@ impl Peer {
         let tjetty =
             unsafe { ffi::urma_import_jetty(ctx.raw(), &mut rjetty, &mut token) };
         let Some(tjetty) = NonNull::new(tjetty) else {
+            let e = null_err("urma_import_jetty");
             unsafe { ffi::urma_unimport_seg(tseg.as_ptr()) };
-            return Err(Error::Null("urma_import_jetty"));
+            return Err(e);
         };
         Ok(Peer { tseg, tjetty, _ctx: ctx.clone() })
     }
@@ -777,5 +866,37 @@ impl<'a> LocalSge<'a> {
             tseg: self.tseg.as_ptr(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// urma_init returns URMA_EEXIST on a second call, so Urma::init must cache
+    /// and clone instead. No device is needed: init only loads providers
+    /// (device errors would come later, from Context::create).
+    #[test]
+    fn init_is_idempotent_per_thread() {
+        let _first = Urma::init().expect("first init");
+        let _second = Urma::init().expect("second init must clone the guard, not hit URMA_EEXIST");
+    }
+
+    /// URMA_LOG_LEVEL drives the stderr mirror: `off` silences it (no callback
+    /// registered, default syslog sink), `0`-`7` picks the level, and anything
+    /// else — unset included — falls back to DEBUG so errors stay visible.
+    #[test]
+    fn log_level_env_mapping() {
+        use std::ffi::OsStr;
+        let dbg = ffi::URMA_VLOG_LEVEL_DEBUG;
+        assert_eq!(stderr_level(None), Some(dbg));
+        assert_eq!(stderr_level(Some(OsStr::new("off"))), None);
+        assert_eq!(stderr_level(Some(OsStr::new("OFF"))), None);
+        assert_eq!(stderr_level(Some(OsStr::new(" 0 "))), Some(0));
+        assert_eq!(stderr_level(Some(OsStr::new("3"))), Some(3));
+        assert_eq!(stderr_level(Some(OsStr::new("7"))), Some(dbg));
+        assert_eq!(stderr_level(Some(OsStr::new("8"))), Some(dbg));
+        assert_eq!(stderr_level(Some(OsStr::new("bogus"))), Some(dbg));
+        assert_eq!(stderr_level(Some(OsStr::new(""))), Some(dbg));
     }
 }

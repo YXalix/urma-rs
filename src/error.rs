@@ -8,8 +8,9 @@ use crate::ffi;
 pub enum Error {
     /// Device missing etc., with a human-readable message
     NotFound(String),
-    /// A create-style API returned NULL
-    Null(&'static str),
+    /// A create-style API returned NULL; errno is captured at the failure site
+    /// (0 when the C library does not set one)
+    Null(&'static str, i32),
     /// A urma call returned non-URMA_SUCCESS
     Status(i32, &'static str),
     /// Timed out polling for a completion
@@ -26,7 +27,12 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotFound(m) => write!(f, "not found: {m}"),
-            Error::Null(what) => write!(f, "{what} returned NULL"),
+            Error::Null(what, errno) if *errno == 0 => write!(f, "{what} returned NULL"),
+            Error::Null(what, errno) => write!(
+                f,
+                "{what} returned NULL (errno {errno}: {})",
+                std::io::Error::from_raw_os_error(*errno)
+            ),
             Error::Status(st, what) => write!(f, "{what} failed, status {st}"),
             Error::PollTimeout { user_ctx } => {
                 write!(f, "poll completion timeout (user_ctx 0x{user_ctx:x})")

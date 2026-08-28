@@ -32,6 +32,20 @@ pub const URMA_TRANSPORT_IP: c_int = 2;
 pub const URMA_TRANSPORT_SOFTUB: c_int = 3;
 pub const URMA_TRANSPORT_HNS_UB: c_int = 5;
 
+/// urma_vlog_level_t (urma_types.h)
+pub const URMA_VLOG_LEVEL_EMERG: i32 = 0;
+pub const URMA_VLOG_LEVEL_ALERT: i32 = 1;
+pub const URMA_VLOG_LEVEL_CRIT: i32 = 2;
+pub const URMA_VLOG_LEVEL_ERR: i32 = 3;
+pub const URMA_VLOG_LEVEL_WARNING: i32 = 4;
+pub const URMA_VLOG_LEVEL_NOTICE: i32 = 5;
+pub const URMA_VLOG_LEVEL_INFO: i32 = 6;
+pub const URMA_VLOG_LEVEL_DEBUG: i32 = 7;
+
+/// C: `typedef void (*urma_log_cb_t)(int level, char *message)` — the message
+/// arrives pre-formatted (the library owns it; only valid during the call)
+pub type urma_log_cb_t = Option<unsafe extern "C" fn(level: i32, message: *mut c_char)>;
+
 /// token validation policy (values of the token_policy field of
 /// urma_reg_seg_flag_t / urma_jfr_flag_t)
 pub const URMA_TOKEN_NONE: u32 = 0;
@@ -578,6 +592,13 @@ pub struct urma_cr_t {
 extern "C" {
     pub fn urma_init(conf: *mut urma_init_attr_t) -> urma_status_t;
     pub fn urma_uninit() -> urma_status_t;
+
+    /* logging: the default sink is syslog; register a callback to see provider
+     * messages elsewhere (the message arrives pre-formatted, no va_list) */
+    pub fn urma_register_log_func(func: urma_log_cb_t) -> urma_status_t;
+    pub fn urma_unregister_log_func() -> urma_status_t;
+    pub fn urma_log_set_level(level: i32);
+    pub fn urma_log_get_level() -> i32;
 
     pub fn urma_get_device_list(num_devices: *mut c_int) -> *mut *mut urma_device_t;
     pub fn urma_free_device_list(device_list: *mut *mut urma_device_t);

@@ -47,6 +47,16 @@ These use `--tcp-hook`: the data plane is emulated by HTTP request-reply
 
 ## Run on real nodes
 
+Real-device runs need **two** UB machines (UB has no single-machine
+loopback). The scripts/test_ub.sh entry runs all three demos across a
+configured node pair over ssh:
+
+```bash
+UB_NODES="192.168.1.11 192.168.1.12" ./scripts/test_ub.sh
+```
+
+Or run the demos by hand:
+
 ```bash
 cargo run --example list_devices   # pick a device name, e.g. bonding_dev_0
 
@@ -59,8 +69,7 @@ cargo run --example urma_lookup -- --master --clients 2
 cargo run --example urma_lookup -- -d bonding_dev_0 -m <master_ip> -n nodeA
 ```
 
-`./scripts/test_ub.sh` runs all three against a real device (SKIPs when
-none is present). Every example documents its full option set in `--help`;
+Every example documents its full option set in `--help`;
 common flags: `-d/--dev` device, `-i/--peer-ip` / `-m/--master-ip` peer,
 `-T/--tcp-hook` emulated data plane, `-p/-P` connect/listen ports,
 `-n/--name` identity in messages.

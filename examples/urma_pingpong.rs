@@ -39,14 +39,17 @@ use clap::Parser;
 use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
-use urma_rs::{Completion, CompletionQueue, Eid, Peer, POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE};
+use urma_rs::{
+    enable_stderr_log_from_env, Completion, CompletionQueue, Eid, Peer, POLL_INTERVAL,
+    POLL_RETRIES, TOKEN_VALUE,
+};
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{
-    cstr_len, default_name, exchange_desc, fill_msg, graceful_shutdown, http_err, report, res_opt,
-    send_retry, PeerDesc, UrmaRes, MSG_SIZE, SCRATCH_OFF,
+    cstr_len, check_loopback, default_name, exchange_desc, fill_msg, graceful_shutdown, http_err,
+    report, res_opt, send_retry, PeerDesc, UrmaRes, MSG_SIZE, SCRATCH_OFF,
 };
 
 const DEFAULT_PORT: u16 = 13859;
@@ -205,6 +208,9 @@ async fn client_run(
      * completion queue */
     let my = res.as_ref().map(|r| r.desc()).unwrap_or_default();
     let info = exchange_desc(http, base, my).await?;
+    if !hook {
+        check_loopback(&my, &info)?;
+    }
 
     let msg: Vec<u8> = if hook {
         /* emulated data plane: request-response */
@@ -297,6 +303,11 @@ impl Args {
 }
 
 async fn run(args: &Args, dev: &str, name: &str) -> Result<()> {
+    if !args.tcp_hook {
+        /* provider/driver errors otherwise go to syslog only; URMA_LOG_LEVEL
+           is the switch (off / 0-7, default DEBUG) */
+        enable_stderr_log_from_env()?;
+    }
     let listen_port = args.listen_port.unwrap_or(args.port);
     let ping = fill_msg(&format!("ping from {name}"));
     let pong = fill_msg(&format!("pong from {name}"));

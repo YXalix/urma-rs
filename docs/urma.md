@@ -65,6 +65,25 @@ agnostic; both sides of a connection must simply agree on the tp_type in
 their respective imports. See `urma_sample.c` (`sample_import_jetty`) and
 `urma_perftest` for reference usage.
 
+## Querying what a device supports
+
+`urma_query_device` returns `urma_device_attr_t`, whose `dev_cap` carries the
+communication-mode capabilities as bitmaps:
+
+- `trans_mode` — bit OR of the supported transport modes (RM/RC/UM);
+- `rm_tp_cap` / `rc_tp_cap` / `um_tp_cap` — per-mode tp types (RTP/CTP/UTP);
+- `rm_order_cap` / `rc_order_cap` — per-mode order types;
+- `tp_feature` — per-mode multi-path support;
+- `feature.ctp_en` — a device-level CTP gate *in addition* to the per-mode
+  cap bits.
+
+The safe layer wraps this as `query_device(name) -> DeviceCap`
+(`DeviceCap::supports(mode, tp)` folds in the `ctp_en` gate) and the examples
+preflight their fixed CTP-RM choice through `common::check_mode_support`
+before creating any resource, so an unsupported mode fails with the device's
+supported-mode matrix instead of an opaque create/import error.
+`list_devices -- --caps` prints the matrix per device as a probe.
+
 ## What this repo uses
 
 All examples run **CTP-RM**:
@@ -77,5 +96,6 @@ All examples run **CTP-RM**:
 - `order_type = 0` (DEF_ORDER) — allowed for RM+CTP per the table above
 
 CTP requires device support: `urma_device_feature.ctp_en` and the
-`rm_tp_cap.ctp` capability bit (queryable via `urma_query_device`). On a
-device without CTP the import fails; the examples do not fall back to RTP.
+`rm_tp_cap.ctp` capability bit (see the querying section above; the examples
+check both up front via `check_mode_support`). On a device without CTP the
+examples stop before creating resources; they do not fall back to RTP.

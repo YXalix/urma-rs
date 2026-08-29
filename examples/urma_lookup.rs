@@ -39,8 +39,8 @@ use urma_rs::{
 mod common;
 
 use common::{
-    cstr_len, check_loopback, default_name, http_err, import_peer, json_retry, report, send_retry,
-    PeerDesc, MSG_SIZE,
+    check_loopback, check_mode_support, cstr_len, default_name, http_err, import_peer, json_retry,
+    report, send_retry, PeerDesc, MSG_SIZE,
 };
 
 /* ============================== Constants and memory layout ============================== */
@@ -149,6 +149,7 @@ struct UrmaTransport {
 
 impl UrmaTransport {
     fn new(dev_name: &str) -> Result<Self> {
+        check_mode_support(dev_name)?;
         let urma = Urma::init()?;
         let ctx = Context::create(&urma, dev_name)?;
         println!("[client] use device {dev_name} eid ({})", ctx.eid());

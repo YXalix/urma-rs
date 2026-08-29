@@ -182,6 +182,323 @@ pub fn list_devices() -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// urma_get_device_by_name with a clean error; the returned pointer stays
+/// owned by the library (the device list outlives all resources)
+fn device_by_name(dev_name: &str) -> Result<*mut ffi::urma_device_t> {
+    let cname =
+        CString::new(dev_name).map_err(|_| Error::Invalid("device name contains NUL".into()))?;
+    let dev = unsafe { ffi::urma_get_device_by_name(cname.as_ptr() as *mut _) };
+    if dev.is_null() {
+        return Err(Error::NotFound(format!(
+            "device '{dev_name}' not found, see list_devices()"
+        )));
+    }
+    Ok(dev)
+}
+
+/* ============================== Device capabilities ============================== */
+
+/// Transport mode (`urma_transport_mode_t`). The device advertises the set it
+/// supports via [`DeviceCap`]; see docs/urma.md for the mode background.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransMode {
+    /// reliable message (the mode all examples run)
+    Rm,
+    /// reliable connection
+    Rc,
+    /// unreliable message
+    Um,
+}
+
+impl TransMode {
+    /// Iteration order used by [`DeviceCap`] displays
+    pub const ALL: [TransMode; 3] = [TransMode::Rm, TransMode::Rc, TransMode::Um];
+
+    /// Bit as used in the device's trans_mode bitmap and in jfs/jfr cfg
+    pub fn bit(self) -> u32 {
+        match self {
+            TransMode::Rm => ffi::URMA_TM_RM,
+            TransMode::Rc => ffi::URMA_TM_RC,
+            TransMode::Um => ffi::URMA_TM_UM,
+        }
+    }
+
+    /// Short name as in the URMA docs (RM/RC/UM)
+    pub fn name(self) -> &'static str {
+        match self {
+            TransMode::Rm => "RM",
+            TransMode::Rc => "RC",
+            TransMode::Um => "UM",
+        }
+    }
+}
+
+impl fmt::Display for TransMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Transport-plane type (`urma_tp_type_t`), chosen by the importer at
+/// `Peer::import` — the create-time cfg has no such field. UB protocol tp
+/// types are RTP/CTP/UTP; all examples run Ctp.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TpType {
+    Rtp,
+    Ctp,
+    Utp,
+}
+
+impl TpType {
+    /// Iteration order used by [`DeviceCap`] displays
+    pub const ALL: [TpType; 3] = [TpType::Rtp, TpType::Ctp, TpType::Utp];
+
+    /// Value for `urma_rjetty_t.tp_type` at import
+    pub fn raw(self) -> u32 {
+        match self {
+            TpType::Rtp => ffi::URMA_TP_RTP,
+            TpType::Ctp => ffi::URMA_TP_CTP,
+            TpType::Utp => ffi::URMA_TP_UTP,
+        }
+    }
+
+    /// Short name as in the URMA docs (RTP/CTP/UTP)
+    pub fn name(self) -> &'static str {
+        match self {
+            TpType::Rtp => "RTP",
+            TpType::Ctp => "CTP",
+            TpType::Utp => "UTP",
+        }
+    }
+}
+
+impl fmt::Display for TpType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Which tp types one transport mode supports (safe view of
+/// `urma_tp_type_cap_t`)
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct TpTypeCap {
+    pub rtp: bool,
+    pub ctp: bool,
+    pub utp: bool,
+}
+
+/// Which order types one transport mode supports (safe view of
+/// `urma_order_type_cap_t`; ot/oi/ol/no per the URMA API Guide §1.2)
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct OrderTypeCap {
+    pub ot: bool,
+    pub oi: bool,
+    pub ol: bool,
+    pub no: bool,
+}
+
+/// Capabilities of one device as reported by `urma_query_device`: which
+/// communication modes (transport mode × tp type) it supports, per-mode
+/// multi-path support, plus the limits the safe layer validates against.
+/// Obtained via [`query_device`]; the matrix form is the [`fmt::Display`]
+/// impl.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceCap {
+    /// Raw bit OR of supported transport modes (`urma_device_cap_t.trans_mode`)
+    pub trans_modes: u16,
+    /// Device-level CTP gate (`feature.ctp_en`): CTP needs this AND the
+    /// per-mode cap bit
+    pub ctp_en: bool,
+    pub rm_tp_cap: TpTypeCap,
+    pub rc_tp_cap: TpTypeCap,
+    pub um_tp_cap: TpTypeCap,
+    pub rm_order_cap: OrderTypeCap,
+    pub rc_order_cap: OrderTypeCap,
+    /// Per-mode multi-path support (`tp_feature`)
+    pub rm_multi_path: bool,
+    pub rc_multi_path: bool,
+    /// Max sges per work request, send / receive side (checked by
+    /// [`JettyOpts::max_sge`])
+    pub max_jfs_sge: u32,
+    pub max_jfr_sge: u32,
+    /// Max message size in bytes
+    pub max_msg_size: u64,
+    /// Supported page sizes as a bitmap (must include 4K, see [`PAGE_SIZE`])
+    pub page_size_cap: u64,
+}
+
+impl DeviceCap {
+    fn from_raw(cap: &ffi::urma_device_cap_t) -> Self {
+        DeviceCap {
+            trans_modes: cap.trans_mode,
+            ctp_en: cap.feature.ctp_en(),
+            rm_tp_cap: TpTypeCap {
+                rtp: cap.rm_tp_cap.rtp(),
+                ctp: cap.rm_tp_cap.ctp(),
+                utp: cap.rm_tp_cap.utp(),
+            },
+            rc_tp_cap: TpTypeCap {
+                rtp: cap.rc_tp_cap.rtp(),
+                ctp: cap.rc_tp_cap.ctp(),
+                utp: cap.rc_tp_cap.utp(),
+            },
+            um_tp_cap: TpTypeCap {
+                rtp: cap.um_tp_cap.rtp(),
+                ctp: cap.um_tp_cap.ctp(),
+                utp: cap.um_tp_cap.utp(),
+            },
+            rm_order_cap: OrderTypeCap {
+                ot: cap.rm_order_cap.ot(),
+                oi: cap.rm_order_cap.oi(),
+                ol: cap.rm_order_cap.ol(),
+                no: cap.rm_order_cap.no(),
+            },
+            rc_order_cap: OrderTypeCap {
+                ot: cap.rc_order_cap.ot(),
+                oi: cap.rc_order_cap.oi(),
+                ol: cap.rc_order_cap.ol(),
+                no: cap.rc_order_cap.no(),
+            },
+            rm_multi_path: cap.tp_feature.rm_multi_path(),
+            rc_multi_path: cap.tp_feature.rc_multi_path(),
+            max_jfs_sge: cap.max_jfs_sge,
+            max_jfr_sge: cap.max_jfr_sge,
+            max_msg_size: cap.max_msg_size,
+            page_size_cap: cap.page_size_cap,
+        }
+    }
+
+    /// Whether the device advertises this transport mode at all
+    pub fn supports_mode(&self, m: TransMode) -> bool {
+        self.trans_modes & m.bit() as u16 != 0
+    }
+
+    /// tp-type capability of one mode (all false when the mode is unsupported)
+    pub fn tp_cap(&self, m: TransMode) -> TpTypeCap {
+        match m {
+            TransMode::Rm => self.rm_tp_cap,
+            TransMode::Rc => self.rc_tp_cap,
+            TransMode::Um => self.um_tp_cap,
+        }
+    }
+
+    /// order-type capability of one mode
+    pub fn order_cap(&self, m: TransMode) -> OrderTypeCap {
+        match m {
+            TransMode::Rm => self.rm_order_cap,
+            TransMode::Rc => self.rc_order_cap,
+            TransMode::Um => OrderTypeCap::default(), /* UM has no cap field */
+        }
+    }
+
+    /// multi-path support of one mode
+    pub fn supports_multi_path(&self, m: TransMode) -> bool {
+        match m {
+            TransMode::Rm => self.rm_multi_path,
+            TransMode::Rc => self.rc_multi_path,
+            TransMode::Um => false,
+        }
+    }
+
+    /// Whether the (mode, tp) communication combination is usable on this
+    /// device: the mode is advertised, the tp type is in the mode's cap, and
+    /// CTP additionally requires the device-level `ctp_en` gate. What the
+    /// library itself only enforces deep inside jetty creation / import (or
+    /// by crashing), surfaced here up front.
+    pub fn supports(&self, m: TransMode, tp: TpType) -> bool {
+        let cap = self.tp_cap(m);
+        let tp_ok = match tp {
+            TpType::Rtp => cap.rtp,
+            TpType::Ctp => cap.ctp && self.ctp_en,
+            TpType::Utp => cap.utp,
+        };
+        self.supports_mode(m) && tp_ok
+    }
+
+    /// Every supported (mode, tp) combination, in declaration order — the
+    /// enumerated answer to "which communication modes does this device
+    /// support"
+    pub fn supported_combos(&self) -> Vec<(TransMode, TpType)> {
+        let mut combos = Vec::new();
+        for m in TransMode::ALL {
+            for tp in TpType::ALL {
+                if self.supports(m, tp) {
+                    combos.push((m, tp));
+                }
+            }
+        }
+        combos
+    }
+}
+
+impl fmt::Display for DeviceCap {
+    /// One line per device, e.g.
+    /// `RM[tp=RTP,CTP order=ot,oi multi-path] RC[tp=RTP order=ol]`
+    /// (`(ctp_en off: CTP unavailable)` appended when the device gate blocks
+    /// CTP that a mode's cap bits advertise)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut any = false;
+        for m in TransMode::ALL {
+            if !self.supports_mode(m) {
+                continue;
+            }
+            if any {
+                f.write_str(" ")?;
+            }
+            any = true;
+
+            let tp = self.tp_cap(m);
+            let tps: Vec<&str> = [
+                (tp.rtp, TpType::Rtp.name()),
+                (tp.ctp, TpType::Ctp.name()),
+                (tp.utp, TpType::Utp.name()),
+            ]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .map(|(_, name)| name)
+            .collect();
+
+            let o = self.order_cap(m);
+            let ords: Vec<&str> = [(o.ot, "ot"), (o.oi, "oi"), (o.ol, "ol"), (o.no, "no")]
+                .into_iter()
+                .filter(|&(on, _)| on)
+                .map(|(_, name)| name)
+                .collect();
+
+            write!(f, "{}[tp={}", m.name(), tps.join(","))?;
+            if !ords.is_empty() {
+                write!(f, " order={}", ords.join(","))?;
+            }
+            if self.supports_multi_path(m) {
+                f.write_str(" multi-path")?;
+            }
+            f.write_str("]")?;
+        }
+        if !any {
+            f.write_str("(no transport mode advertised)")?;
+        } else if !self.ctp_en {
+            f.write_str(" (ctp_en off: CTP unavailable)")?;
+        }
+        Ok(())
+    }
+}
+
+/// Query one device's capabilities by name (`urma_query_device`): the
+/// supported communication modes (transport mode × tp type, multi-path) and
+/// the limits, see [`DeviceCap`]. Lets callers validate their mode choice up
+/// front instead of debugging an opaque failure from jetty creation or
+/// import later.
+pub fn query_device(dev_name: &str) -> Result<DeviceCap> {
+    let _urma = Urma::init()?;
+    let dev = device_by_name(dev_name)?;
+    let mut attr = ffi::urma_device_attr_t::default();
+    check_status(
+        unsafe { ffi::urma_query_device(dev, &mut attr) },
+        "urma_query_device",
+    )?;
+    Ok(DeviceCap::from_raw(&attr.dev_cap))
+}
+
 /* ============================== context ============================== */
 
 struct ContextInner {
@@ -211,14 +528,7 @@ impl Context {
     /// `urma_create_context`. The `Urma` guard argument proves the library is
     /// initialized (and is kept alive internally).
     pub fn create(urma: &Urma, dev_name: &str) -> Result<Self> {
-        let cname = CString::new(dev_name)
-            .map_err(|_| Error::Invalid("device name contains NUL".into()))?;
-        let dev = unsafe { ffi::urma_get_device_by_name(cname.as_ptr() as *mut _) };
-        if dev.is_null() {
-            return Err(Error::NotFound(format!(
-                "device '{dev_name}' not found, see list_devices()"
-            )));
-        }
+        let dev = device_by_name(dev_name)?;
 
         let mut eid_cnt: u32 = 0;
         let list = unsafe { ffi::urma_get_eid_list(dev, &mut eid_cnt) };
@@ -952,5 +1262,56 @@ mod tests {
     fn init_is_idempotent_per_thread() {
         let _first = Urma::init().expect("first init");
         let _second = Urma::init().expect("second init must clone the guard, not hit URMA_EEXIST");
+    }
+
+    /// DeviceCap::supports / supported_combos mirror the device's cap bits
+    /// (no device needed: built from a hand-filled raw cap)
+    #[test]
+    fn device_cap_mode_logic() {
+        let tpcap = |v: u32| ffi::urma_tp_type_cap_t { value: v };
+        let ordcap = |v: u32| ffi::urma_order_type_cap_t { value: v };
+        let tpfeat = |v: u32| ffi::urma_tp_feature_t { value: v };
+
+        let mut raw = ffi::urma_device_cap_t::default();
+        raw.trans_mode = ffi::URMA_TM_RM as u16 | ffi::URMA_TM_RC as u16 | ffi::URMA_TM_UM as u16;
+        raw.feature = ffi::urma_device_feature_t::default().with_ctp_en(true);
+        raw.rm_tp_cap = tpcap(ffi::URMA_TP_TYPE_CAP_RTP | ffi::URMA_TP_TYPE_CAP_CTP);
+        raw.rc_tp_cap = tpcap(ffi::URMA_TP_TYPE_CAP_RTP);
+        raw.um_tp_cap = tpcap(ffi::URMA_TP_TYPE_CAP_UTP);
+        raw.rm_order_cap = ordcap(ffi::URMA_ORDER_CAP_OI | ffi::URMA_ORDER_CAP_OL);
+        raw.rc_order_cap = ordcap(ffi::URMA_ORDER_CAP_OL);
+        raw.tp_feature = tpfeat(ffi::URMA_TP_FEAT_RM_MULTI_PATH);
+
+        let cap = DeviceCap::from_raw(&raw);
+        assert!(cap.supports_mode(TransMode::Rm));
+        assert!(cap.supports(TransMode::Rm, TpType::Rtp));
+        assert!(cap.supports(TransMode::Rm, TpType::Ctp));
+        assert!(!cap.supports(TransMode::Rc, TpType::Ctp)); /* rc cap has no ctp bit */
+        assert!(!cap.supports(TransMode::Um, TpType::Ctp));
+        assert!(cap.supports(TransMode::Um, TpType::Utp));
+        assert!(cap.supports_multi_path(TransMode::Rm));
+        assert!(!cap.supports_multi_path(TransMode::Rc));
+        assert_eq!(
+            cap.supported_combos(),
+            vec![
+                (TransMode::Rm, TpType::Rtp),
+                (TransMode::Rm, TpType::Ctp),
+                (TransMode::Rc, TpType::Rtp),
+                (TransMode::Um, TpType::Utp)
+            ]
+        );
+
+        /* ctp_en gates CTP even when the per-mode cap bit is set */
+        raw.feature = ffi::urma_device_feature_t::default();
+        let cap = DeviceCap::from_raw(&raw);
+        assert!(!cap.supports(TransMode::Rm, TpType::Ctp));
+        assert!(cap.supports(TransMode::Rm, TpType::Rtp));
+        assert!(cap.to_string().contains("ctp_en off"));
+
+        /* a mode absent from the bitmap is never supported, whatever its caps */
+        raw.trans_mode = ffi::URMA_TM_RM as u16;
+        let cap = DeviceCap::from_raw(&raw);
+        assert!(!cap.supports(TransMode::Um, TpType::Utp));
+        assert!(!cap.supports_mode(TransMode::Rc));
     }
 }

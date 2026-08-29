@@ -13,7 +13,7 @@ logic testing without a URMA device.
 | `urma_hello` | two nodes read "hello world" from each other | one-sided READ; out-of-band `/bye` teardown |
 | `urma_pingpong` | ping-pong echo between two nodes | two-sided SEND/RECV; in-band teardown via CQ completions |
 | `urma_lookup` | record directory: HTTP-only master assigns id ranges, clients fetch records from each other P2P | one-sided READ; data plane bypasses the master |
-| `list_devices` | prints URMA device names, one per line | probe tool (`urma_get_device_list`), exit 0 iff a device exists |
+| `list_devices` | prints URMA device names, one per line | probe tool (`urma_get_device_list`), exit 0 iff a device exists; `--caps` appends each device's supported communication-mode matrix (`urma_query_device`) |
 
 ## Conventions
 
@@ -59,6 +59,10 @@ Or run the demos by hand:
 
 ```bash
 cargo run --example list_devices   # pick a device name, e.g. bonding_dev_0
+cargo run --example list_devices -- --caps   # + per-device supported-mode matrix
+#   bonding_dev_0
+#     modes  : RM[tp=RTP,CTP order=oi multi-path] ...
+#     combos : RM-RTP RM-CTP ...   limits: max_jfs_sge ... max_msg_size ...
 
 # on both nodes, each pointing at the other's IP:
 cargo run --example urma_hello    -- -d bonding_dev_0 -i <peer_ip> -n nodeA
@@ -68,6 +72,12 @@ cargo run --example urma_pingpong -- -d bonding_dev_0 -i <peer_ip> -n nodeA
 cargo run --example urma_lookup -- --master --clients 2
 cargo run --example urma_lookup -- -d bonding_dev_0 -m <master_ip> -n nodeA
 ```
+
+Before creating any resource, every real-device run also preflights the
+fixed CTP-RM mode against these capabilities
+(`common::check_mode_support`): on an unsupported device it fails
+immediately with the supported-mode matrix instead of an opaque
+jetty-creation / import error.
 
 Every example documents its full option set in `--help`;
 common flags: `-d/--dev` device, `-i/--peer-ip` / `-m/--master-ip` peer,

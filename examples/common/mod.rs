@@ -19,8 +19,8 @@ use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
 use urma_rs::{
-    CompletionQueue, Context, Eid, Jetty, JettyId, JettyOpts, Peer, RegisteredBuf, SegDesc, Urma,
-    DEFAULT_DEPTH, TOKEN_VALUE,
+    query_device, CompletionQueue, Context, Eid, Jetty, JettyId, JettyOpts, Peer, RegisteredBuf,
+    SegDesc, TpType, TransMode, Urma, DEFAULT_DEPTH, TOKEN_VALUE,
 };
 
 /// Fixed message length (hello/ping-pong message, single lookup record)
@@ -241,6 +241,49 @@ pub fn import_peer(ctx: &Context, desc: &PeerDesc) -> Result<Peer> {
     }
 }
 
+/* ============================== mode preflight ============================== */
+
+/// Preflight the fixed communication mode all examples run — RM transport,
+/// CTP tp type at import, multi-path on bonding devices (see docs/urma.md):
+/// query the device capabilities first, so an unsupported mode fails here
+/// with the device's supported-mode matrix instead of surfacing as an opaque
+/// jetty-creation / import error (or a crash) much later. Never call it in
+/// tcp-hook mode (no device exists there).
+pub fn check_mode_support(dev: &str) -> Result<()> {
+    let cap = query_device(dev)?;
+    let multi_path = dev.starts_with("bonding");
+
+    let mut missing = Vec::new();
+    if !cap.supports_mode(TransMode::Rm) {
+        missing.push(format!("transport mode {}", TransMode::Rm.name()));
+    } else {
+        if !cap.supports(TransMode::Rm, TpType::Ctp) {
+            missing.push(format!(
+                "tp type {} for {}{}",
+                TpType::Ctp.name(),
+                TransMode::Rm.name(),
+                if cap.tp_cap(TransMode::Rm).ctp && !cap.ctp_en {
+                    " (the mode allows CTP but the device feature ctp_en is off)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if multi_path && !cap.supports_multi_path(TransMode::Rm) {
+            missing.push("multi-path for RM (bonding devices run RM with multi-path)".to_string());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(Error::Invalid(format!(
+            "device '{dev}' does not support the CTP-RM mode these examples run; \
+             missing: {}; device supports: {cap}",
+            missing.join(", ")
+        )));
+    }
+    println!("[mode] device {dev} supports: {cap}");
+    Ok(())
+}
+
 /* ============================== URMA resource bundle ============================== */
 
 /// The full resource set for hello/ping-pong, bundled for convenience. Child
@@ -263,6 +306,7 @@ impl UrmaRes {
     /// Build the full resource set and place `msg` (MSG_SIZE bytes) in [0, MSG_SIZE):
     /// in hello it waits to be READ by the peer; in ping-pong it is the SEND payload.
     pub fn create(role: &str, dev: &str, msg: &[u8]) -> Result<Self> {
+        check_mode_support(dev)?;
         let urma = Urma::init()?;
         let ctx = Context::create(&urma, dev)?;
         println!("[{role}] use device {dev} eid ({})", ctx.eid());

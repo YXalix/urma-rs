@@ -23,6 +23,9 @@ use std::os::raw::{c_char, c_int};
 pub const URMA_EID_SIZE: usize = 16;
 pub const URMA_MAX_NAME: usize = 64;
 pub const URMA_MAX_PATH: usize = 4096;
+pub const URMA_GUID_SIZE: usize = 16;
+pub const URMA_MAX_PRIORITY_CNT: usize = 16;
+pub const MAX_PORT_CNT: usize = 8;
 
 /// urma_transport_type_t (values of urma_device_t.type_)
 pub const URMA_TRANSPORT_INVALID: c_int = -1;
@@ -80,6 +83,28 @@ pub const URMA_TP_UTP: u32 = 2;
 pub const URMA_TARGET_JFR: u32 = 0;
 pub const URMA_TARGET_JETTY: u32 = 1;
 pub const URMA_TARGET_JETTY_GROUP: u32 = 2;
+
+/// Bits of urma_device_feature_t (urma_types.h): oor 0, jfc_per_wr 1,
+/// stride_op 2, load_store_op 3, non_pin 4, pmem 5, jfc_inline 6, spray_en 7,
+/// selective_retrans 8, live_migrate 9, dca 10, jetty_grp 11, error_suspend 12,
+/// outorder_comp 13, mn 14, clan 15, muti_seg_per_token_id 16, ipourma_en 17,
+/// ctp_en 18, uboe 19
+pub const URMA_FEATURE_CTP_EN: u32 = 1 << 18;
+
+/// Bits of urma_tp_type_cap_t / urma_tp_type_en_t (same layout)
+pub const URMA_TP_TYPE_CAP_RTP: u32 = 1 << 0;
+pub const URMA_TP_TYPE_CAP_CTP: u32 = 1 << 1;
+pub const URMA_TP_TYPE_CAP_UTP: u32 = 1 << 2;
+
+/// Bits of urma_order_type_cap_t (bit index, NOT the urma_order_type_t value)
+pub const URMA_ORDER_CAP_OT: u32 = 1 << 0;
+pub const URMA_ORDER_CAP_OI: u32 = 1 << 1;
+pub const URMA_ORDER_CAP_OL: u32 = 1 << 2;
+pub const URMA_ORDER_CAP_NO: u32 = 1 << 3;
+
+/// Bits of urma_tp_feature_t
+pub const URMA_TP_FEAT_RM_MULTI_PATH: u32 = 1 << 0;
+pub const URMA_TP_FEAT_RC_MULTI_PATH: u32 = 1 << 1;
 
 /// urma_jetty_grp_policy_t
 pub const URMA_JETTY_GRP_POLICY_RR: u32 = 0;
@@ -175,6 +200,200 @@ pub struct urma_device_t {
 pub struct urma_eid_info_t {
     pub eid: urma_eid_t,
     pub eid_index: u32,
+}
+
+/* ---------- device capabilities (urma_query_device output) ---------- */
+
+/// C: `union urma_device_feature_t`, modeled as `value` + helpers for the
+/// bits the safe layer reads (see the URMA_FEATURE_* constants for the layout)
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_device_feature_t {
+    pub value: u32,
+}
+
+impl urma_device_feature_t {
+    /// CTP requires this device-level gate in addition to the per-mode
+    /// tp cap bits (see docs/urma.md)
+    pub fn ctp_en(&self) -> bool {
+        self.value & URMA_FEATURE_CTP_EN != 0
+    }
+
+    pub fn with_ctp_en(mut self, on: bool) -> Self {
+        if on {
+            self.value |= URMA_FEATURE_CTP_EN;
+        } else {
+            self.value &= !URMA_FEATURE_CTP_EN;
+        }
+        self
+    }
+}
+
+/// C: `union urma_atomic_feature_t` (cas bit0, swap bit1, fetch_and_* bits2..7)
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_atomic_feature_t {
+    pub value: u32,
+}
+
+/// C: `union urma_tp_type_cap_t` — which tp types one trans mode supports
+/// (same bit layout as `urma_tp_type_en_t`)
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_tp_type_cap_t {
+    pub value: u32,
+}
+
+impl urma_tp_type_cap_t {
+    pub fn rtp(&self) -> bool {
+        self.value & URMA_TP_TYPE_CAP_RTP != 0
+    }
+
+    pub fn ctp(&self) -> bool {
+        self.value & URMA_TP_TYPE_CAP_CTP != 0
+    }
+
+    pub fn utp(&self) -> bool {
+        self.value & URMA_TP_TYPE_CAP_UTP != 0
+    }
+}
+
+/// C: `union urma_order_type_cap_t` — which order types one trans mode
+/// supports (bit index, not the urma_order_type_t value)
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_order_type_cap_t {
+    pub value: u32,
+}
+
+impl urma_order_type_cap_t {
+    pub fn ot(&self) -> bool {
+        self.value & URMA_ORDER_CAP_OT != 0
+    }
+
+    pub fn oi(&self) -> bool {
+        self.value & URMA_ORDER_CAP_OI != 0
+    }
+
+    pub fn ol(&self) -> bool {
+        self.value & URMA_ORDER_CAP_OL != 0
+    }
+
+    pub fn no(&self) -> bool {
+        self.value & URMA_ORDER_CAP_NO != 0
+    }
+}
+
+/// C: `union urma_tp_feature_t` — per-mode multi-path support
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_tp_feature_t {
+    pub value: u32,
+}
+
+impl urma_tp_feature_t {
+    pub fn rm_multi_path(&self) -> bool {
+        self.value & URMA_TP_FEAT_RM_MULTI_PATH != 0
+    }
+
+    pub fn rc_multi_path(&self) -> bool {
+        self.value & URMA_TP_FEAT_RC_MULTI_PATH != 0
+    }
+}
+
+/// C: `union urma_tp_type_en` (per-SL tp type enable, inside urma_sl_info_t)
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct urma_tp_type_en_t {
+    pub value: u32,
+}
+
+/// C: `struct urma_sl_info`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct urma_sl_info_t {
+    pub sl: u32, /* header field name: SL */
+    pub tp_type: urma_tp_type_en_t,
+}
+
+/// C: `urma_port_attr_t` (enums modeled as c_int: C enums are 4 bytes here)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct urma_port_attr_t {
+    pub max_mtu: c_int,      /* urma_mtu_t */
+    pub state: c_int,        /* urma_port_state_t */
+    pub active_width: c_int, /* urma_link_width_t */
+    pub active_speed: c_int, /* urma_speed_t */
+    pub active_mtu: c_int,   /* urma_mtu_t */
+}
+
+/// C: `urma_guid_t`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct urma_guid_t {
+    pub raw: [u8; URMA_GUID_SIZE],
+}
+
+/// C: `urma_device_cap_t` — capabilities of one device. trans_mode is a bit
+/// OR of urma_transport_mode_t; each mode has its own tp-type / order-type
+/// cap; tp_feature carries per-mode multi-path support.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct urma_device_cap_t {
+    pub feature: urma_device_feature_t,
+    pub max_jfc: u32,
+    pub max_jfs: u32,
+    pub max_jfr: u32,
+    pub max_jetty: u32,
+    pub max_jetty_grp: u32,
+    pub max_jetty_in_jetty_grp: u32,
+    pub max_jfc_depth: u32,
+    pub max_jfs_depth: u32,
+    pub max_jfr_depth: u32,
+    pub max_jfs_inline_len: u32,
+    pub max_jfs_sge: u32,
+    pub max_jfs_rsge: u32,
+    pub max_jfr_sge: u32,
+    pub max_msg_size: u64,
+    pub max_read_size: u32,
+    pub max_write_size: u32,
+    pub max_cas_size: u32,
+    pub max_swap_size: u32,
+    pub max_fetch_and_add_size: u32,
+    pub max_fetch_and_sub_size: u32,
+    pub max_fetch_and_and_size: u32,
+    pub max_fetch_and_or_size: u32,
+    pub max_fetch_and_xor_size: u32,
+    pub atomic_feat: urma_atomic_feature_t,
+    pub trans_mode: u16, /* bit OR of urma_transport_mode_t */
+    pub reserved: u16,
+    pub congestion_ctrl_alg: u16,
+    pub ceq_cnt: u32,
+    pub max_tp_in_tpg: u32,
+    pub max_eid_cnt: u32,
+    pub page_size_cap: u64,
+    pub max_oor_cnt: u32,
+    pub mn: u32,
+    pub max_netaddr_cnt: u32,
+    pub rm_order_cap: urma_order_type_cap_t,
+    pub rc_order_cap: urma_order_type_cap_t,
+    pub rm_tp_cap: urma_tp_type_cap_t,
+    pub rc_tp_cap: urma_tp_type_cap_t,
+    pub um_tp_cap: urma_tp_type_cap_t,
+    pub tp_feature: urma_tp_feature_t,
+    pub priority_info: [urma_sl_info_t; URMA_MAX_PRIORITY_CNT],
+}
+
+/// C: `urma_device_attr_t` — output of `urma_query_device` (caller allocates)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct urma_device_attr_t {
+    pub guid: urma_guid_t,
+    pub dev_cap: urma_device_cap_t,
+    pub port_cnt: u8,
+    pub port_attr: [urma_port_attr_t; MAX_PORT_CNT],
+    pub reserved_jetty_id_min: u32,
+    pub reserved_jetty_id_max: u32,
 }
 
 /// Opaque: urma_context_t (contains pthread_mutex_t / fd, etc.), crosses the
@@ -606,6 +825,11 @@ extern "C" {
     pub fn urma_get_eid_list(dev: *mut urma_device_t, cnt: *mut u32) -> *mut urma_eid_info_t;
     pub fn urma_free_eid_list(eid_list: *mut urma_eid_info_t);
 
+    pub fn urma_query_device(
+        dev: *mut urma_device_t,
+        dev_attr: *mut urma_device_attr_t,
+    ) -> urma_status_t;
+
     pub fn urma_create_context(dev: *mut urma_device_t, eid_index: u32) -> *mut urma_context_t;
     pub fn urma_delete_context(ctx: *mut urma_context_t) -> urma_status_t;
 
@@ -701,6 +925,13 @@ mod tests {
         assert_eq!((size_of::<urma_jfs_wr_t>(), align_of::<urma_jfs_wr_t>()), (80, 8));
         assert_eq!((size_of::<urma_jfr_wr_t>(), align_of::<urma_jfr_wr_t>()), (32, 8));
         assert_eq!((size_of::<urma_cr_t>(), align_of::<urma_cr_t>()), (80, 8));
+
+        // device-capability structs (urma_query_device output)
+        assert_eq!((size_of::<urma_sl_info_t>(), align_of::<urma_sl_info_t>()), (8, 4));
+        assert_eq!((size_of::<urma_port_attr_t>(), align_of::<urma_port_attr_t>()), (20, 4));
+        assert_eq!((size_of::<urma_guid_t>(), align_of::<urma_guid_t>()), (16, 1));
+        assert_eq!((size_of::<urma_device_cap_t>(), align_of::<urma_device_cap_t>()), (304, 8));
+        assert_eq!((size_of::<urma_device_attr_t>(), align_of::<urma_device_attr_t>()), (496, 8));
     }
 
     /// Critical field offsets the hand-written model depends on (including
@@ -742,6 +973,48 @@ mod tests {
         assert_eq!(offset_of!(urma_jfr_cfg_t, token_value), 32);
         assert_eq!(offset_of!(urma_jfs_cfg_t, jfc), 24);
         assert_eq!(offset_of!(urma_jfc_cfg_t, jfce), 16);
+
+        // urma_device_cap_t: u64 fields force the padding at 52..56 and
+        // 124..128; the per-mode caps sit behind the scalar tail
+        assert_eq!(offset_of!(urma_device_cap_t, max_msg_size), 56);
+        assert_eq!(offset_of!(urma_device_cap_t, trans_mode), 104);
+        assert_eq!(offset_of!(urma_device_cap_t, page_size_cap), 128);
+        assert_eq!(offset_of!(urma_device_cap_t, rm_order_cap), 148);
+        assert_eq!(offset_of!(urma_device_cap_t, rm_tp_cap), 156);
+        assert_eq!(offset_of!(urma_device_cap_t, rc_tp_cap), 160);
+        assert_eq!(offset_of!(urma_device_cap_t, um_tp_cap), 164);
+        assert_eq!(offset_of!(urma_device_cap_t, tp_feature), 168);
+        assert_eq!(offset_of!(urma_device_cap_t, priority_info), 172);
+
+        // urma_device_attr_t: dev_cap follows the 16-byte guid; port_cnt
+        // (u8) leaves 3 padding bytes before the 4-aligned port_attr array
+        assert_eq!(offset_of!(urma_device_attr_t, dev_cap), 16);
+        assert_eq!(offset_of!(urma_device_attr_t, port_cnt), 320);
+        assert_eq!(offset_of!(urma_device_attr_t, port_attr), 324);
+        assert_eq!(offset_of!(urma_device_attr_t, reserved_jetty_id_min), 484);
+    }
+
+    #[test]
+    fn cap_union_helpers() {
+        let f = urma_device_feature_t::default().with_ctp_en(true);
+        assert!(f.ctp_en());
+        assert_eq!(f.value, URMA_FEATURE_CTP_EN);
+        assert!(!urma_device_feature_t::default().ctp_en());
+
+        let c = urma_tp_type_cap_t { value: URMA_TP_TYPE_CAP_RTP | URMA_TP_TYPE_CAP_CTP };
+        assert!(c.rtp());
+        assert!(c.ctp());
+        assert!(!c.utp());
+
+        let o = urma_order_type_cap_t { value: URMA_ORDER_CAP_OT | URMA_ORDER_CAP_NO };
+        assert!(o.ot());
+        assert!(o.no());
+        assert!(!o.oi());
+        assert!(!o.ol());
+
+        let t = urma_tp_feature_t { value: URMA_TP_FEAT_RM_MULTI_PATH };
+        assert!(t.rm_multi_path());
+        assert!(!t.rc_multi_path());
     }
 
     #[test]

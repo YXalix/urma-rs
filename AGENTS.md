@@ -10,8 +10,9 @@ plus example demos.
 - `src/urma.rs` — safe RAII wrapper layer. `src/error.rs` — Error/Result.
   `src/lib.rs` — module wiring + crate-root re-exports.
 - `examples/` — `urma_hello` (one-sided READ), `urma_pingpong` (two-sided
-  SEND/RECV), `urma_lookup` (P2P directory), `list_devices` (probe tool);
-  shared helpers in `examples/common/mod.rs` (pulled in via `#[path]`).
+  SEND/RECV), `urma_lookup` (P2P directory), `list_devices` (probe tool,
+  `--caps` prints each device's supported-mode matrix); shared helpers in
+  `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
 - `docs/urma.md` — URMA background concepts (resource model, transport
   parameter rules, CTP-RM rationale).
@@ -20,8 +21,8 @@ plus example demos.
 
 ```bash
 cargo build --examples      # lib + examples (linking needs liburma.so)
-cargo test                  # 5 guard tests (4 ffi ABI layout + Urma::init
-                            # idempotence)
+cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
+                            # idempotence + device-cap mode logic)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
@@ -68,6 +69,14 @@ cargo clippy --examples
   the full background; references:
   `/root/openEuler/umdk/doc/ch/urma/URMA API Guide.ch.md`,
   `/root/openEuler/umdk/src/urma/examples/urma_sample.c` (`-t 1` = CTP).
+- Device capabilities are queryable up front: `urma_query_device` is bound
+  in ffi.rs (cap structs + layout guards) and wrapped as
+  `query_device(name) -> DeviceCap` (`supports(mode, tp)` folds in the
+  `ctp_en` gate; `Display` renders the supported-mode matrix). All
+  real-device example runs preflight CTP-RM (+ RM multi-path on bonding)
+  via `common::check_mode_support` before creating any resource, so an
+  unsupported mode fails with the matrix instead of an opaque
+  create/import error; `list_devices --caps` prints it as a probe.
 - The token-id (protection table) mechanism is intentionally disabled:
   `token_policy`/`token_id_valid` are all 0; authentication is only the plain
   `token_value` agreed by both peers (`TOKEN_VALUE = 0xACFE`). The driver still

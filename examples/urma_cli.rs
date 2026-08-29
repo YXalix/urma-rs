@@ -394,7 +394,10 @@ fn read_run(a: &ReadArgs) -> Result<()> {
         comp.status, comp.completion_len, comp.user_ctx
     );
 
-    let n = (comp.completion_len as usize).min(a.len as usize);
+    /* READ completions carry no length on this provider (completion_len
+       stays 0); the landing buffer holds whatever was asked for — same
+       approach as urma_hello */
+    let n = a.len as usize;
     let data = &landing[..n];
     println!("[read ] data: \"{}\"", String::from_utf8_lossy(data).trim_end_matches('\0'));
     println!("[read ] hex[..{HEX_PREVIEW}]: {}", hex_enc(&data[..n.min(HEX_PREVIEW)]));

@@ -11,8 +11,12 @@ plus example demos.
   `src/lib.rs` — module wiring + crate-root re-exports.
 - `examples/` — `urma_hello` (one-sided READ), `urma_pingpong` (two-sided
   SEND/RECV), `urma_lookup` (P2P directory), `list_devices` (probe tool,
-  `--caps` prints each device's supported-mode matrix); shared helpers in
-  `examples/common/mod.rs` (pulled in via `#[path]`).
+  `--caps` prints each device's supported-mode matrix), `urma_cli` (minimal
+  pure-URMA CLI, the single-file usage example of the whole API: `list
+  [--caps]` probe plus `serve`/`read` manual copy-paste READ with
+  `--mode`/`--tp` communication-mode selection — no HTTP control plane, no
+  tokio/serde, and deliberately no `common/mod.rs` include); shared helpers
+  in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
 - `docs/urma.md` — URMA background concepts (resource model, transport
   parameter rules, CTP-RM rationale).
@@ -23,6 +27,9 @@ plus example demos.
 cargo build --examples      # lib + examples (linking needs liburma.so)
 cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
                             # idempotence + device-cap mode logic)
+cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
+                            # targets are compiled but not run by plain
+                            # `cargo test`)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
@@ -57,12 +64,17 @@ cargo clippy --examples
 
 ## Domain facts
 
-- All use cases run **CTP-RM**: `trans_mode = URMA_TM_RM` (reliable message,
-  multi-path) + `tp_type = URMA_CTP` (Compact Transport; UB protocol TP types
-  are RTP/CTP/UTP). `tp_type` is NOT a create-time parameter — `urma_jfs_cfg_t`
-  /`urma_jfr_cfg_t` have no such field; it is chosen by the importer in
-  `urma_rjetty_t.tp_type` at `urma_import_jetty` (single site:
-  `Peer::import` in `src/urma.rs`). RM + CTP + default order_type (0) is an
+- The demos default to **CTP-RM**: `trans_mode = URMA_TM_RM` (reliable
+  message, multi-path) + `tp_type = URMA_CTP` (Compact Transport; UB
+  protocol TP types are RTP/CTP/UTP), via `JettyOpts::trans_mode`
+  (default `TransMode::Rm`) at create and the `tp: TpType` argument at
+  import. The layer is otherwise mode-parameterized — `urma_cli` exposes
+  `--mode rm|rc|um` / `--tp rtp|ctp|utp` to run any combination the device
+  advertises (both sides must pass the same values). `tp_type` is NOT a
+  create-time parameter — `urma_jfs_cfg_t`/`urma_jfr_cfg_t` have no such
+  field; it is chosen by the importer in `urma_rjetty_t.tp_type` at
+  `urma_import_jetty` (`Peer::import`/`Peer::import_ctx` in `src/urma.rs`).
+  RM + CTP + default order_type (0) is an
   allowed combination per umdk's URMA API Guide §1.2 (RM+CTP+NO is blocked,
   RM is reliable); CTP additionally requires device support
   (`urma_device_feature.ctp_en` / `rm_tp_cap.ctp`). See `docs/urma.md` for
@@ -73,10 +85,12 @@ cargo clippy --examples
   in ffi.rs (cap structs + layout guards) and wrapped as
   `query_device(name) -> DeviceCap` (`supports(mode, tp)` folds in the
   `ctp_en` gate; `Display` renders the supported-mode matrix). All
-  real-device example runs preflight CTP-RM (+ RM multi-path on bonding)
-  via `common::check_mode_support` before creating any resource, so an
-  unsupported mode fails with the matrix instead of an opaque
-  create/import error; `list_devices --caps` prints it as a probe.
+  real-device example runs preflight their mode (CTP-RM + RM multi-path on
+  bonding) via `common::check_mode_support` before creating any resource —
+  `urma_cli` does the same for its selected `--mode`/`--tp` with an in-file
+  parameterized copy — so an unsupported mode fails with the matrix instead
+  of an opaque create/import error; `list_devices --caps` and
+  `urma_cli list --caps` print it as a probe.
 - The token-id (protection table) mechanism is intentionally disabled:
   `token_policy`/`token_id_valid` are all 0; authentication is only the plain
   `token_value` agreed by both peers (`TOKEN_VALUE = 0xACFE`). The driver still
@@ -140,9 +154,10 @@ cargo clippy --examples
   from its topo snapshot (this is exactly urma_perftest's bonding-duplex
   path, which is why perftest works while plain-descriptor imports fail).
   `urma_get_rjetty` requires a shared jfr (our `Jetty::new` always sets
-  SHARE_JFR). All examples route imports through `common::import_peer`,
-  which uses the blob path; the plain-field `PeerDesc` members remain for
-  logging and `check_loopback` only.
+  SHARE_JFR). All HTTP examples route imports through `common::import_peer`,
+  which uses the blob path; `urma_cli` calls `Peer::import_ctx` directly on
+  the hand-packed hex descriptor for the same reason; the plain-field
+  `PeerDesc` members remain for logging and `check_loopback` only.
 - This crate has NO logging layer: the URMA libraries log to syslog
   (facility `user`, `[URMA]` tag) on their own — liburma core honors
   `urma_register_log_func` callbacks, but the tpsa provider (libuvs) always

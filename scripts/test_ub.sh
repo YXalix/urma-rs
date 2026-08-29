@@ -48,7 +48,7 @@ echo "UB nodes: $A (nodeA) + $B (nodeB)"
 
 # --- build + deploy --------------------------------------------------------
 cargo build --examples || exit 1
-BINS="urma_hello urma_pingpong urma_lookup list_devices"
+BINS="urma_hello urma_pingpong urma_lookup list_devices urma_cli"
 
 deploy() {  # <node> -> remote dir on stdout
     local rdir
@@ -165,9 +165,32 @@ for me in nodeA nodeB; do
     done
 done
 
+# --- 4) urma_cli: manual descriptor exchange (serve on A, read on B) --------
+echo "== urma_cli =="
+run_node "$A" "$RDIR_A" cli.serve.log urma_cli serve -d "$DEV_A" &
+PSERVE=$!
+# serve prints the descriptor as one hex line once its resources are up;
+# play the human: grab it from the log and pass it as read's argument
+DESC=""
+for _ in $(seq 1 30); do
+    DESC=$(sed -n 's/^\[desc\] //p' "$LOGDIR/cli.serve.log" 2>/dev/null | head -1)
+    [ -n "$DESC" ] && break
+    sleep 1
+done
+if [ -z "$DESC" ]; then
+    echo "MISSING: no [desc] line from urma_cli serve on $A"
+    FAIL=1
+else
+    run_node "$B" "$RDIR_B" cli.read.log urma_cli read -d "$DEV_B" "$DESC" || FAIL=1
+    check cli.read.log '[read ] completion: status 0 len 64'
+    check cli.read.log '[read ] data: "hello from urma-cli@'
+fi
+kill "$PSERVE" 2>/dev/null
+wait "$PSERVE" 2>/dev/null
+
 # --- verdict ---------------------------------------------------------------
 if [ "$FAIL" -eq 0 ]; then
-    echo "PASS: UB testcases (urma_hello + urma_pingpong + urma_lookup) between $IP_A and $IP_B"
+    echo "PASS: UB testcases (urma_hello + urma_pingpong + urma_lookup + urma_cli) between $IP_A and $IP_B"
 else
     echo "FAIL: log tails:"
     tail -n 10 "$LOGDIR"/*.log

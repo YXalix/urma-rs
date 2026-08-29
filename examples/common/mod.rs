@@ -212,7 +212,7 @@ pub fn import_peer(ctx: &Context, desc: &PeerDesc) -> Result<Peer> {
     const IMPORT_RETRIES: u32 = 30;
     let mut attempt = 0;
     loop {
-        match Peer::import_ctx(ctx, &desc.seg_ctx, &desc.rjetty, TOKEN_VALUE) {
+        match Peer::import_ctx(ctx, &desc.seg_ctx, &desc.rjetty, TpType::Ctp, TOKEN_VALUE) {
             Ok(p) => return Ok(p),
             Err(Error::Null(_, ENOEXEC)) if attempt < IMPORT_RETRIES => {
                 if attempt == 0 {

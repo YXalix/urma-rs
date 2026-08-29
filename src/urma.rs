@@ -658,6 +658,9 @@ impl CompletionQueue {
 #[derive(Clone, Copy, Debug)]
 pub struct JettyOpts {
     pub depth: u32,
+    /// Transport mode of the jfr/jfs (RM reliable / RC / UM unreliable);
+    /// the tp_type is chosen later, at import time. Both peers must agree.
+    pub trans_mode: TransMode,
     /// Must be true for bonding devices + RM mode
     pub multi_path: bool,
     /// Plain token value (`urma_token_t`), matched by the peer on import
@@ -671,7 +674,13 @@ pub struct JettyOpts {
 
 impl Default for JettyOpts {
     fn default() -> Self {
-        JettyOpts { depth: DEFAULT_DEPTH, multi_path: false, token_value: TOKEN_VALUE, max_sge: 1 }
+        JettyOpts {
+            depth: DEFAULT_DEPTH,
+            trans_mode: TransMode::Rm,
+            multi_path: false,
+            token_value: TOKEN_VALUE,
+            max_sge: 1,
+        }
     }
 }
 
@@ -686,14 +695,15 @@ pub struct Jetty {
 }
 
 impl Jetty {
-    /// Fixed RM transport mode (order_type uses default 0); the tp_type
-    /// (CTP) is only chosen later, at import time — see Peer::import
+    /// `opts.trans_mode` fixes the transport mode (order_type uses default 0,
+    /// which every mode accepts); the tp_type is only chosen later, at import
+    /// time — see [`Peer::import_ctx`]
     pub fn new(ctx: &Context, cq: &CompletionQueue, opts: JettyOpts) -> Result<Self> {
         /* jfr: one-sided READ never receives data through it, but jetty is created with share_jfr, so it must be created first */
         let mut jfr_cfg = ffi::urma_jfr_cfg_t {
             depth: opts.depth,
             flag: ffi::urma_jfr_flag_t { value: 0 }, /* NO_TAG_MATCHING + order 0 */
-            trans_mode: ffi::URMA_TM_RM,
+            trans_mode: opts.trans_mode.bit(),
             max_sge: opts.max_sge,
             min_rnr_timer: ffi::URMA_TYPICAL_MIN_RNR_TIMER,
             jfc: cq.jfc(),
@@ -710,7 +720,7 @@ impl Jetty {
         let jfs_cfg = ffi::urma_jfs_cfg_t {
             depth: opts.depth,
             flag: jfs_flag,
-            trans_mode: ffi::URMA_TM_RM,
+            trans_mode: opts.trans_mode.bit(),
             priority: ffi::URMA_MAX_PRIORITY,
             max_sge: opts.max_sge,
             rnr_retry: ffi::URMA_TYPICAL_RNR_RETRY,
@@ -1041,19 +1051,21 @@ impl Peer {
     /// provider resolves psegs/pjettys locally from its topology snapshot
     /// instead of doing the kernel-side info exchange — which rides the
     /// management comm channel and fails with errno ENOEXEC when that channel
-    /// is down. `tp_type` is the importer's choice and is patched to CTP in
-    /// the rjetty blob, exactly like [`Peer::import`] sets it.
+    /// is down. `tp_type` is the importer's choice (tp_type is NOT a
+    /// create-time parameter) and is patched into the rjetty blob; the
+    /// transport mode is inherited from the exporter's jetty via the blob.
     pub fn import_ctx(
         ctx: &Context,
         seg_ctx: &[u8],
         rjetty: &[u8],
+        tp: TpType,
         token_value: u32,
     ) -> Result<Self> {
         let seg = Self::aligned_blob(seg_ctx, std::mem::size_of::<ffi::urma_seg_t>(), "seg ctx")?;
         let mut rj =
             Self::aligned_blob(rjetty, std::mem::size_of::<ffi::urma_rjetty_t>(), "rjetty")?;
         let rj_ptr = rj.as_mut_ptr() as *mut ffi::urma_rjetty_t;
-        unsafe { (*rj_ptr).tp_type = ffi::URMA_TP_CTP }; /* CTP-RM, chosen at import */
+        unsafe { (*rj_ptr).tp_type = tp.raw() }; /* chosen at import, not at create */
 
         /* cacheable/mapping are both 0 (NON_CACHEABLE + SEG_NOMAP); only the access field is set */
         let imp_flag = ffi::urma_import_seg_flag_t::default()
@@ -1080,7 +1092,19 @@ impl Peer {
         Ok(Peer { tseg, tjetty, _ctx: ctx.clone() })
     }
 
-    pub fn import(ctx: &Context, seg: SegDesc, jetty: JettyId, token_value: u32) -> Result<Self> {
+    /// Import from the plain descriptor. The plain fields do not carry a
+    /// transport mode, so it must be passed explicitly and must match the
+    /// exporter's `JettyOpts::trans_mode`; `tp_type` is the importer's choice.
+    /// On bonding devices prefer [`Peer::import_ctx`], which bypasses the
+    /// kernel-side info exchange (see the doc there).
+    pub fn import(
+        ctx: &Context,
+        seg: SegDesc,
+        jetty: JettyId,
+        mode: TransMode,
+        tp: TpType,
+        token_value: u32,
+    ) -> Result<Self> {
         let mut ubva = ffi::urma_ubva_t { eid: seg.eid.0, uasid: seg.uasid, ..Default::default() };
         ubva.set_va(seg.va);
         let mut seg_in = ffi::urma_seg_t {
@@ -1102,10 +1126,10 @@ impl Peer {
 
         let mut rjetty = ffi::urma_rjetty_t {
             jetty_id: jetty.to_raw(),
-            trans_mode: ffi::URMA_TM_RM,
+            trans_mode: mode.bit(),
             policy: ffi::URMA_JETTY_GRP_POLICY_RR,
             type_: ffi::URMA_TARGET_JETTY,
-            tp_type: ffi::URMA_TP_CTP, /* CTP-RM; tp_type is chosen at import, not at create */
+            tp_type: tp.raw(), /* tp_type is chosen at import, not at create */
             ..Default::default()
         };
 

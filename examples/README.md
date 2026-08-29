@@ -14,13 +14,20 @@ logic testing without a URMA device.
 | `urma_pingpong` | ping-pong echo between two nodes | two-sided SEND/RECV; in-band teardown via CQ completions |
 | `urma_lookup` | record directory: HTTP-only master assigns id ranges, clients fetch records from each other P2P | one-sided READ; data plane bypasses the master |
 | `list_devices` | prints URMA device names, one per line | probe tool (`urma_get_device_list`), exit 0 iff a device exists; `--caps` appends each device's supported communication-mode matrix (`urma_query_device`) |
+| `urma_cli` | minimal pure-URMA CLI, the single-file usage example of the whole API | `list [--caps]` device probe, `serve`/`read` one-sided READ where the descriptor travels by manual copy-paste (no HTTP control plane at all); `--mode`/`--tp` select any advertised communication combination, both sides must agree |
 
 ## Conventions
 
 - **Control plane is HTTP JSON** (axum server + reqwest client in the same
   binary): it does only what URMA cannot — publishing and exchanging the
   segment+jetty descriptor (`PeerDesc`). It is a Rust-to-Rust demo
-  protocol, not a stable wire format.
+  protocol, not a stable wire format. `urma_cli` is the deliberate
+  exception: it has no control plane at all (no tokio/serde either, and it
+  does not include `common/mod.rs`) — `serve` prints the descriptor as one
+  hand-packed hex line that you paste as `read`'s positional argument on
+  the other node, which also sidesteps the bonding topology-snapshot
+  ordering by construction (the reading side only starts once `serve` is
+  up).
 - **Clients retry forever on connect failure**, so peers can start in any
   order; Ctrl+C exits. Non-2xx replies fail immediately.
 - **Server + client in one process** (hello/pingpong): `tokio::join!` polls
@@ -78,6 +85,18 @@ fixed CTP-RM mode against these capabilities
 (`common::check_mode_support`): on an unsupported device it fails
 immediately with the supported-mode matrix instead of an opaque
 jetty-creation / import error.
+
+The minimal path — `urma_cli`, no HTTP at all, the descriptor travels by
+copy-paste (defaults are CTP-RM like the other demos; `--mode`/`--tp` run
+any combination the device advertises, both sides must pass the same
+values):
+
+```bash
+# terminal on nodeA: registers memory, prints the descriptor, holds it
+cargo run --example urma_cli -- serve -d bonding_dev_0
+# terminal on nodeB: paste the [desc] hex line as the positional argument
+cargo run --example urma_cli -- read -d bonding_dev_0 '<the [desc] hex line>'
+```
 
 Every example documents its full option set in `--help`;
 common flags: `-d/--dev` device, `-i/--peer-ip` / `-m/--master-ip` peer,

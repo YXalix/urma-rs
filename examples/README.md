@@ -68,8 +68,10 @@ Or run the demos by hand:
 cargo run --example list_devices   # pick a device name, e.g. bonding_dev_0
 cargo run --example list_devices -- --caps   # + per-device supported-mode matrix
 #   bonding_dev_0
-#     modes  : RM[tp=RTP,CTP order=oi multi-path] ...
-#     combos : RM-RTP RM-CTP ...   limits: max_jfs_sge ... max_msg_size ...
+#     modes  : RM[tp=RTP,CTP order=oi multi-path] RC[tp=] UM[tp=]
+#     combos : RM-RTP RM-CTP
+#     limits : max_jfs_sge 13 max_jfr_sge 4 max_msg_size 65536 page_size_cap 0x0
+#   (legend: modes = transport modes RM/RC/UM with their usable tp types; ...)
 
 # on both nodes, each pointing at the other's IP:
 cargo run --example urma_hello    -- -d bonding_dev_0 -i <peer_ip> -n nodeA
@@ -79,6 +81,20 @@ cargo run --example urma_pingpong -- -d bonding_dev_0 -i <peer_ip> -n nodeA
 cargo run --example urma_lookup -- --master --clients 2
 cargo run --example urma_lookup -- -d bonding_dev_0 -m <master_ip> -n nodeA
 ```
+
+How to read the `--caps` block (`urma_cli list --caps` prints the same, plus
+a legend trailer): `modes` walks every transport mode the device advertises —
+RM reliable message, RC reliable connection, UM unreliable message — with the
+tp types the mode can use (`tp=RTP,CTP`,..), its order types (`order=oi`,..)
+and `multi-path` when it can span several physical ports. An empty `tp=`
+(e.g. `RC[tp=]`) means the mode bit is set but no tp type is usable, so the
+mode is effectively unavailable. `combos` is the flattened answer: every
+(mode, tp) pair you may actually use (CTP additionally requires the
+device-level `ctp_en` gate) — the valid `--mode`/`--tp` values for the demos.
+`limits` caps a workload: `max_jfs_sge`/`max_jfr_sge` scatter-gather entries
+per send/recv, `max_msg_size` largest single message in bytes,
+`page_size_cap` page-size bitmap for pinned registration (0 = not reported by
+the provider). The concepts behind the three knobs are in `docs/urma.md`.
 
 Before creating any resource, every real-device run also preflights the
 fixed CTP-RM mode against these capabilities

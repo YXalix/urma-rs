@@ -82,7 +82,28 @@ The safe layer wraps this as `query_device(name) -> DeviceCap`
 preflight their fixed CTP-RM choice through `common::check_mode_support`
 before creating any resource, so an unsupported mode fails with the device's
 supported-mode matrix instead of an opaque create/import error.
-`list_devices -- --caps` prints the matrix per device as a probe.
+`list_devices -- --caps` prints the matrix per device as a probe
+(`urma_cli list --caps` prints the same plus a legend trailer):
+
+```
+bonding_dev_0
+  modes  : RM[tp=CTP] RC[tp=] UM[tp=]
+  combos : RM-CTP
+  limits : max_jfs_sge 13 max_jfr_sge 4 max_msg_size 65536 page_size_cap 0x0
+```
+
+- `modes` walks every advertised transport mode; inside the brackets: `tp=`
+  the tp types the mode can use, `order=` its order types (ot/oi/ol/no),
+  `multi-path` when the mode can span several physical ports. An empty
+  `tp=` (`RC[tp=]` above) means the mode bit is set but no tp type is
+  usable, so the mode is effectively unavailable.
+- `combos` is the flattened answer — every (mode, tp) pair that passes
+  `supports()` — i.e. the valid `--mode`/`--tp` values for the examples.
+- `limits` — `max_jfs_sge`/`max_jfr_sge`: max scatter-gather entries per
+  send / receive work request; `max_msg_size`: largest single message in
+  bytes; `page_size_cap`: page-size bitmap for pinned registration
+  (0 = the provider did not report one; the plain register path does not
+  need it).
 
 ## What this repo uses
 

@@ -57,6 +57,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// list devices, one per line; --caps appends each device's supported-mode matrix
+    #[command(
+        after_help = "The --caps block, per device:\n  \
+                      modes  : every advertised transport mode (RM reliable message, RC reliable\n  \
+                      connection, UM unreliable message) with the tp types it can use\n  \
+                      (tp=RTP,CTP,...), its order types (order=ot,oi,...) and multi-path;\n  \
+                      RC[tp=] means the mode bit is set but no tp type is usable, so the\n  \
+                      mode is effectively unavailable\n  \
+                      combos : the (mode, tp) pairs usable as serve/read --mode/--tp values\n  \
+                      (CTP additionally requires the device-level ctp_en gate)\n  \
+                      limits : max_jfs_sge/max_jfr_sge = scatter-gather entries per\n  \
+                      send/recv, max_msg_size = largest single message in bytes,\n  \
+                      page_size_cap = page-size bitmap for pinned registration"
+    )]
     List {
         #[arg(long)]
         caps: bool,
@@ -190,6 +203,14 @@ fn list_run(caps: bool) -> Result<()> {
                 Err(e) => eprintln!("  query failed: {e}"),
             }
         }
+    }
+    if caps {
+        println!(
+            "  (legend: modes = transport modes RM/RC/UM with their usable tp types; an
+   empty tp= means the mode is advertised but unusable here; combos = the valid
+   --mode/--tp pairs; limits = per-send/recv sge, message-size and page-size
+   ceilings. Background: docs/urma.md)"
+        );
     }
     Ok(())
 }

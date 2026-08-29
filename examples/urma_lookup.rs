@@ -39,8 +39,8 @@ use urma_rs::{
 mod common;
 
 use common::{
-    cstr_len, check_loopback, default_name, http_err, json_retry, report, send_retry, PeerDesc,
-    MSG_SIZE,
+    cstr_len, check_loopback, default_name, http_err, import_peer, json_retry, report, send_retry,
+    PeerDesc, MSG_SIZE,
 };
 
 /* ============================== Constants and memory layout ============================== */
@@ -139,6 +139,10 @@ struct UrmaTransport {
     cq: CompletionQueue,
     jetty: Jetty,
     buf: RegisteredBuf,
+    /// exported import blobs (urma_get_seg_ctx / urma_get_rjetty); on bonding
+    /// they let the peer import without the kernel-side exchange
+    seg_ctx: Vec<u8>,
+    rjetty: Vec<u8>,
     peers: Vec<Option<Peer>>,
     _urma: Urma,
 }
@@ -155,7 +159,9 @@ impl UrmaTransport {
             JettyOpts { multi_path: dev_name.starts_with("bonding"), ..Default::default() },
         )?;
         let buf = RegisteredBuf::new(&ctx, buf_len(), TOKEN_VALUE)?;
-        Ok(UrmaTransport { ctx, cq, jetty, buf, peers: Vec::new(), _urma: urma })
+        let seg_ctx = buf.export_seg_ctx()?;
+        let rjetty = jetty.export_rjetty()?;
+        Ok(UrmaTransport { ctx, cq, jetty, buf, seg_ctx, rjetty, peers: Vec::new(), _urma: urma })
     }
 }
 
@@ -165,7 +171,12 @@ impl Transport for UrmaTransport {
     }
 
     fn desc(&self) -> PeerDesc {
-        PeerDesc::of(self.buf.descriptor(), self.jetty.id())
+        PeerDesc::of(
+            self.buf.descriptor(),
+            self.jetty.id(),
+            self.seg_ctx.clone(),
+            self.rjetty.clone(),
+        )
     }
 
     fn with_buf(&mut self, f: &mut dyn FnMut(&mut [u8])) {
@@ -177,8 +188,7 @@ impl Transport for UrmaTransport {
         if self.peers.len() <= idx {
             self.peers.resize_with(idx + 1, || None);
         }
-        let (seg, jetty) = o.desc.to_pair();
-        let peer = Peer::import(&self.ctx, seg, jetty, TOKEN_VALUE)?;
+        let peer = import_peer(&self.ctx, &o.desc)?;
         self.peers[idx] = Some(peer);
         Ok(())
     }

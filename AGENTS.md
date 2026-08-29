@@ -76,7 +76,9 @@ cargo clippy --examples
   exchange: the importer's kernel sends it to the remote, which resolves the
   segment by it (`ubagg_connect.c handle_seg_req`), so `descriptor()` must
   ship `seg.token_id` as-is (publishing a hardcoded 0 makes import fail — or
-  resolve a wrong seg — whenever the peer's allocation isn't 0). Unlike
+  resolve a wrong seg — whenever the peer's allocation isn't 0; conversely, a
+  0 in the log is legitimate when it is the peer's first-ever registration,
+  not a sign of this bug). Unlike
   token_id, `attr`'s has_user_info bit (ext data we never ship) must be masked
   off before publishing.
 - `urma_init` is once-per-process in the C library (second call returns
@@ -108,6 +110,30 @@ cargo clippy --examples
   gating on the peer's 200 would deadlock): `HELLO_RES_DELAY_MS=<n>` holds
   resource creation back n ms after the peer first answers, as an experiment
   knob for the import-time SIGSEGV.
+- A different import failure class is the kernel-side seg/jetty info exchange
+  between the two bonding devices (`ubagg_connect_xchg_seg` /
+  `ubagg_connect_xchg_jetty`): any failure inside it (peer's agg EID not in
+  the kernel's global topo map, comm msg undeliverable, remote token-id
+  lookup miss, 30s session timeout) is mapped to `-ENOEXEC`, surfacing as
+  `urma_tlv_ioctl ... errno=8, cmd=6` (cmd 6 = URMA_CMD_IMPORT_SEG) and
+  `Error::Null("urma_import_seg", 8)`. This path uses the kernel's LIVE topo
+  map (fed asynchronously by the fabric management stack via the set-topo
+  ioctl), NOT the process's snapshot, so restarting the process does not
+  help — diagnose via `dmesg | grep -i ubagg` on BOTH nodes. Observed root
+  cause on bonding_dev_0: the kernel ubmad component's own jetty imports
+  fail with `UDMA: tp mode is not supported, tp type: 2` (UTP unsupported
+  by the physical devices), the management comm channel never comes up, and
+  every exchange session times out (`ubagg_session_timeout` in dmesg).
+  The robust fix is to BYPASS the exchange: publish the
+  `urma_get_seg_ctx` / `urma_get_rjetty` blobs (they append the
+  per-physical-device info as has_user_info ext) and import via
+  `Peer::import_ctx` — the provider then resolves psegs/pjettys locally
+  from its topo snapshot (this is exactly urma_perftest's bonding-duplex
+  path, which is why perftest works while plain-descriptor imports fail).
+  `urma_get_rjetty` requires a shared jfr (our `Jetty::new` always sets
+  SHARE_JFR). All examples route imports through `common::import_peer`,
+  which uses the blob path; the plain-field `PeerDesc` members remain for
+  logging and `check_loopback` only.
 - liburma's default log sink is syslog, so provider/driver errors never reach
   the terminal. The examples call `urma_rs::enable_stderr_log_from_env()`
   before creating resources to mirror `[urma:N] ...` lines to stderr.

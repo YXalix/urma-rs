@@ -479,6 +479,31 @@ impl Jetty {
         self.id
     }
 
+    /// Export the remote-import descriptor as an opaque blob
+    /// (`urma_get_rjetty`; requires a shared jfr, which [`Jetty::new`] always
+    /// sets). Same bonding rationale as [`RegisteredSeg::export_seg_ctx`]:
+    /// the appended ext lets the importer skip the kernel-side jetty exchange.
+    pub fn export_rjetty(&self) -> Result<Vec<u8>> {
+        let mut raw: *mut ffi::urma_rjetty_t = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        check_status(
+            unsafe { ffi::urma_get_rjetty(self.raw.as_ptr(), &mut raw, &mut len) },
+            "urma_get_rjetty",
+        )?;
+        let Some(raw) = NonNull::new(raw) else {
+            return Err(null_err("urma_get_rjetty"));
+        };
+        let min = std::mem::size_of::<ffi::urma_rjetty_t>();
+        if (len as usize) < min {
+            unsafe { ffi::urma_put_rjetty(raw.as_ptr()) };
+            return Err(Error::Invalid(format!("rjetty blob too short: {len} < {min}")));
+        }
+        let blob = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, len as usize) };
+        let blob = blob.to_vec();
+        unsafe { ffi::urma_put_rjetty(raw.as_ptr()) };
+        Ok(blob)
+    }
+
     /// Validate a local sge list against `JettyOpts::max_sge` and convert to ffi
     fn check_local(&self, local: &[LocalSge]) -> Result<Vec<ffi::urma_sge_t>> {
         if local.is_empty() {
@@ -673,6 +698,36 @@ impl<B> RegisteredSeg<B> {
         }
     }
 
+    /// Export the full segment context as an opaque blob
+    /// (`urma_get_seg_ctx`; the library-allocated buffer is copied out and
+    /// freed with `urma_put_seg_ctx`). On bonding devices the blob appends
+    /// the per-physical-device info (has_user_info ext: each pseg's EID +
+    /// token_id), so the importer resolves everything locally and skips the
+    /// kernel-side seg exchange (ubagg_connect_xchg_seg) that rides the
+    /// management comm channel — the path urma_perftest uses on bonding.
+    /// On plain devices the blob is just the `urma_seg_t`.
+    pub fn export_seg_ctx(&self) -> Result<Vec<u8>> {
+        let mut raw: *mut ffi::urma_seg_t = std::ptr::null_mut();
+        let mut size: u32 = 0;
+        check_status(
+            unsafe { ffi::urma_get_seg_ctx(self.tseg.as_ptr(), &mut raw, &mut size) },
+            "urma_get_seg_ctx",
+        )?;
+        let Some(raw) = NonNull::new(raw) else {
+            return Err(null_err("urma_get_seg_ctx"));
+        };
+        let min = std::mem::size_of::<ffi::urma_seg_t>();
+        if (size as usize) < min {
+            unsafe { ffi::urma_put_seg_ctx(raw.as_ptr()) };
+            return Err(Error::Invalid(format!("seg ctx blob too short: {size} < {min}")));
+        }
+        let blob =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, size as usize) };
+        let blob = blob.to_vec();
+        unsafe { ffi::urma_put_seg_ctx(raw.as_ptr()) };
+        Ok(blob)
+    }
+
     /// Window `[off, off + len)` of this segment as a [`LocalSge`],
     /// bounds-checked; shorthand for [`LocalSge::new`]
     pub fn sge(&self, off: usize, len: u32) -> Result<LocalSge<'_>> {
@@ -699,6 +754,71 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Copy a blob into a u64-aligned buffer: a C struct is read through the
+    /// resulting pointer, while a plain `Vec<u8>` guarantees no alignment
+    fn aligned_blob(bytes: &[u8], min: usize, what: &str) -> Result<Vec<u64>> {
+        if bytes.len() < min {
+            return Err(Error::Invalid(format!(
+                "{what} blob too short: {} < {min}",
+                bytes.len()
+            )));
+        }
+        let mut buf = vec![0u64; bytes.len().div_ceil(8)];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buf.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            )
+        };
+        Ok(buf)
+    }
+
+    /// Import from the exported blobs ([`RegisteredSeg::export_seg_ctx`] /
+    /// [`Jetty::export_rjetty`]). Preferred over [`Peer::import`] on bonding
+    /// devices: the blobs carry the peer's per-physical-device info, so the
+    /// provider resolves psegs/pjettys locally from its topology snapshot
+    /// instead of doing the kernel-side info exchange — which rides the
+    /// management comm channel and fails with errno ENOEXEC when that channel
+    /// is down. `tp_type` is the importer's choice and is patched to CTP in
+    /// the rjetty blob, exactly like [`Peer::import`] sets it.
+    pub fn import_ctx(
+        ctx: &Context,
+        seg_ctx: &[u8],
+        rjetty: &[u8],
+        token_value: u32,
+    ) -> Result<Self> {
+        let seg = Self::aligned_blob(seg_ctx, std::mem::size_of::<ffi::urma_seg_t>(), "seg ctx")?;
+        let mut rj =
+            Self::aligned_blob(rjetty, std::mem::size_of::<ffi::urma_rjetty_t>(), "rjetty")?;
+        let rj_ptr = rj.as_mut_ptr() as *mut ffi::urma_rjetty_t;
+        unsafe { (*rj_ptr).tp_type = ffi::URMA_TP_CTP }; /* CTP-RM, chosen at import */
+
+        /* cacheable/mapping are both 0 (NON_CACHEABLE + SEG_NOMAP); only the access field is set */
+        let imp_flag = ffi::urma_import_seg_flag_t::default()
+            .with_access(ffi::URMA_ACCESS_READ | ffi::URMA_ACCESS_WRITE);
+
+        let mut token = ffi::urma_token_t { token: token_value };
+        let tseg = unsafe {
+            ffi::urma_import_seg(
+                ctx.raw(),
+                seg.as_ptr() as *mut ffi::urma_seg_t,
+                &mut token,
+                0,
+                imp_flag,
+            )
+        };
+        let tseg = NonNull::new(tseg).ok_or_else(|| null_err("urma_import_seg"))?;
+
+        let tjetty = unsafe { ffi::urma_import_jetty(ctx.raw(), rj_ptr, &mut token) };
+        let Some(tjetty) = NonNull::new(tjetty) else {
+            let e = null_err("urma_import_jetty");
+            unsafe { ffi::urma_unimport_seg(tseg.as_ptr()) };
+            return Err(e);
+        };
+        Ok(Peer { tseg, tjetty, _ctx: ctx.clone() })
+    }
+
     pub fn import(ctx: &Context, seg: SegDesc, jetty: JettyId, token_value: u32) -> Result<Self> {
         let mut ubva = ffi::urma_ubva_t { eid: seg.eid.0, uasid: seg.uasid, ..Default::default() };
         ubva.set_va(seg.va);

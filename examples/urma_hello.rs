@@ -59,14 +59,14 @@ use clap::Parser;
 use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
-use urma_rs::{enable_stderr_log_from_env, Eid, Peer, TOKEN_VALUE};
+use urma_rs::{enable_stderr_log_from_env, Eid};
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{
-    cstr_len, check_loopback, default_name, fill_msg, http_err, report, send_retry, PeerDesc,
-    UrmaRes, CONNECT_RETRY_S, MSG_SIZE, SCRATCH_OFF,
+    cstr_len, check_loopback, default_name, fill_msg, http_err, import_peer, report, send_retry,
+    PeerDesc, UrmaRes, CONNECT_RETRY_S, MSG_SIZE, SCRATCH_OFF,
 };
 
 const DEFAULT_PORT: u16 = 13857;
@@ -98,8 +98,8 @@ struct SrvState {
 
 async fn get_info(State(st): State<SrvState>) -> Response {
     let desc = st.desc.read().unwrap();
-    match *desc {
-        Some(d) => (StatusCode::OK, Json(d)).into_response(),
+    match &*desc {
+        Some(d) => (StatusCode::OK, Json(d.clone())).into_response(),
         None => (StatusCode::SERVICE_UNAVAILABLE, "descriptor not ready").into_response(),
     }
 }
@@ -289,7 +289,7 @@ async fn client_run(
         b.bytes().await.map_err(http_err)?.to_vec()
     } else {
         let r = res.as_ref().expect("urma mode requires resources");
-        let (seg, jetty) = info.to_pair();
+        let (seg, _jetty) = info.to_pair();
         println!(
             "[client] importing peer ({}, uasid 0x{:x}): seg va 0x{:x} len {} attr 0x{:x} token_id {}, jetty uasid 0x{:x} id {} (my jetty id {}, my token_id {})",
             Eid(info.eid),
@@ -303,18 +303,7 @@ async fn client_run(
             my.jetty_id,
             my.seg_token_id
         );
-        let p = match Peer::import(&r.ctx, seg, jetty, TOKEN_VALUE) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[client] note: if the liburma log shows 'Failed to find connected port', \
-                     this process's topology snapshot predates the peer's links (it is taken \
-                     once per process and never refreshed); restarting this process now that \
-                     the peer is up resolves it"
-                );
-                return Err(e);
-            }
-        };
+        let p = import_peer(&r.ctx, &info)?;
         println!(
             "[client] peer ({}, uasid 0x{:x}) segment: va 0x{:x} len {}",
             seg.eid, seg.uasid, seg.va, seg.len

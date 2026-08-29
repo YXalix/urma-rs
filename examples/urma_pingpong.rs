@@ -40,8 +40,7 @@ use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
 use urma_rs::{
-    enable_stderr_log_from_env, Completion, CompletionQueue, Eid, Peer, POLL_INTERVAL,
-    POLL_RETRIES, TOKEN_VALUE,
+    enable_stderr_log_from_env, Completion, CompletionQueue, Eid, POLL_INTERVAL, POLL_RETRIES,
 };
 
 #[path = "common/mod.rs"]
@@ -49,7 +48,7 @@ mod common;
 
 use common::{
     cstr_len, check_loopback, default_name, exchange_desc, fill_msg, graceful_shutdown, http_err,
-    report, res_opt, send_retry, PeerDesc, UrmaRes, MSG_SIZE, SCRATCH_OFF,
+    import_peer, report, res_opt, send_retry, PeerDesc, UrmaRes, MSG_SIZE, SCRATCH_OFF,
 };
 
 const DEFAULT_PORT: u16 = 13859;
@@ -101,12 +100,12 @@ async fn get_info(State(st): State<SrvState>) -> Json<PeerDesc> {
 }
 
 async fn post_import(State(st): State<SrvState>, Json(p): Json<PeerDesc>) -> StatusCode {
-    *st.imported.lock().unwrap() = Some(p);
     println!(
         "[server] peer ({}, uasid 0x{:x}) imported, waiting for its ping",
         Eid(p.eid),
         p.uasid
     );
+    *st.imported.lock().unwrap() = Some(p);
     StatusCode::NO_CONTENT
 }
 
@@ -140,9 +139,10 @@ async fn echo_round(res: &UrmaRes, imported: &Arc<Mutex<Option<PeerDesc>>>) -> R
     let info = imported
         .lock()
         .unwrap()
+        .clone()
         .ok_or_else(|| Error::Invalid("ping arrived before peer info".into()))?;
-    let (seg, jetty) = info.to_pair();
-    let peer = Peer::import(&res.ctx, seg, jetty, TOKEN_VALUE)?;
+    let (seg, _jetty) = info.to_pair();
+    let peer = import_peer(&res.ctx, &info)?;
     println!("[server] pong to peer ({}, uasid 0x{:x})", seg.eid, seg.uasid);
 
     let pong = res.buf.sge(0, MSG_SIZE as u32)?;
@@ -183,7 +183,14 @@ async fn server_run(
     /* URMA echo round runs concurrently with axum; in hook mode the data plane is handled in the /msg handler */
     let echo = async {
         match res {
-            Some(res) => echo_round(&res, &imported).await,
+            Some(res) => {
+                let r = echo_round(&res, &imported).await;
+                /* one round is the whole demo: release the HTTP server below (in
+                 * hook mode the /msg handler notifies done). Notified on error
+                 * too, or a failed round would hang the join. */
+                done.notify_one();
+                r
+            }
             None => Ok(()),
         }
     };
@@ -207,7 +214,7 @@ async fn client_run(
      * done after this — data plane and teardown sync all go through the URMA
      * completion queue */
     let my = res.as_ref().map(|r| r.desc()).unwrap_or_default();
-    let info = exchange_desc(http, base, my).await?;
+    let info = exchange_desc(http, base, &my).await?;
     if !hook {
         check_loopback(&my, &info)?;
     }
@@ -218,8 +225,8 @@ async fn client_run(
         b.bytes().await.map_err(http_err)?.to_vec()
     } else {
         let r = res.expect("urma mode requires resources");
-        let (seg, jetty) = info.to_pair();
-        let peer = Peer::import(&r.ctx, seg, jetty, TOKEN_VALUE)?;
+        let (seg, _jetty) = info.to_pair();
+        let peer = import_peer(&r.ctx, &info)?;
         println!("[client] peer ({}, uasid 0x{:x}) jetty imported", seg.eid, seg.uasid);
 
         /* post receive buffer before sending ping: the pong always has a place to land (otherwise RNR) */

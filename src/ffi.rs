@@ -645,6 +645,24 @@ extern "C" {
     ) -> *mut urma_target_seg_t;
     pub fn urma_unimport_seg(tseg: *mut urma_target_seg_t) -> urma_status_t;
 
+    /* Export as opaque blobs: on bonding devices the blob appends the
+       per-physical-device info (has_user_info ext), letting the importer
+       resolve everything locally and skip the kernel-side seg/jetty
+       exchange. Blobs are freed with the put fns; non-bonding devices
+       export just the plain struct. */
+    pub fn urma_get_seg_ctx(
+        tseg: *mut urma_target_seg_t,
+        seg: *mut *mut urma_seg_t,
+        size: *mut u32,
+    ) -> urma_status_t;
+    pub fn urma_put_seg_ctx(seg: *mut urma_seg_t);
+    pub fn urma_get_rjetty(
+        jetty: *mut urma_jetty_t,
+        rjetty: *mut *mut urma_rjetty_t,
+        length: *mut u32,
+    ) -> urma_status_t;
+    pub fn urma_put_rjetty(rjetty: *mut urma_rjetty_t);
+
     pub fn urma_post_jetty_send_wr(
         jetty: *mut urma_jetty_t,
         wr: *mut urma_jfs_wr_t,

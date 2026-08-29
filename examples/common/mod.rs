@@ -19,7 +19,7 @@ use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
 use urma_rs::{
-    CompletionQueue, Context, Eid, Jetty, JettyId, JettyOpts, RegisteredBuf, SegDesc, Urma,
+    CompletionQueue, Context, Eid, Jetty, JettyId, JettyOpts, Peer, RegisteredBuf, SegDesc, Urma,
     DEFAULT_DEPTH, TOKEN_VALUE,
 };
 
@@ -80,13 +80,12 @@ pub async fn json_retry<T: serde::de::DeserializeOwned>(
 pub async fn exchange_desc(
     http: &reqwest::Client,
     base: &str,
-    my: PeerDesc,
+    my: &PeerDesc,
 ) -> Result<PeerDesc> {
     let peer: PeerDesc = json_retry(http, |c| c.get(format!("{base}/info"))).await?;
-    send_retry(http, |c| c.post(format!("{base}/import")).json(&my)).await?;
+    send_retry(http, |c| c.post(format!("{base}/import")).json(my)).await?;
     Ok(peer)
 }
-
 /// axum graceful-shutdown signal: finish on the first of done (one round
 /// complete) or stop (the early-exit channel used when this process's
 /// client fails).
@@ -139,9 +138,13 @@ pub fn report(r: Result<()>) -> ExitCode {
 /* ============================== peer descriptor ============================== */
 
 /// JSON form of the peer's data-plane resources (segment + jetty). After the
-/// control-plane exchange, `to_pair()` rebuilds the arguments for
-/// `Peer::import`. All zeros in tcp-hook mode.
-#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+/// control-plane exchange, `import_peer` imports from it. The plain fields are
+/// kept for logging and the loopback check; the import itself runs on the
+/// exported blobs (`urma_get_seg_ctx` / `urma_get_rjetty`), which on bonding
+/// carry the per-physical-device info and let the import skip the kernel-side
+/// seg/jetty exchange (the urma_perftest bonding path). All empty in tcp-hook
+/// mode.
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct PeerDesc {
     pub eid: [u8; 16],
     pub uasid: u32,
@@ -152,10 +155,14 @@ pub struct PeerDesc {
     pub jetty_eid: [u8; 16],
     pub jetty_uasid: u32,
     pub jetty_id: u32,
+    /// `RegisteredSeg::export_seg_ctx` blob (urma_seg_t + bonding ext)
+    pub seg_ctx: Vec<u8>,
+    /// `Jetty::export_rjetty` blob (urma_rjetty_t + bonding ext)
+    pub rjetty: Vec<u8>,
 }
 
 impl PeerDesc {
-    pub fn of(seg: SegDesc, jetty: JettyId) -> Self {
+    pub fn of(seg: SegDesc, jetty: JettyId, seg_ctx: Vec<u8>, rjetty: Vec<u8>) -> Self {
         PeerDesc {
             eid: seg.eid.0,
             uasid: seg.uasid,
@@ -166,10 +173,12 @@ impl PeerDesc {
             jetty_eid: jetty.eid.0,
             jetty_uasid: jetty.uasid,
             jetty_id: jetty.id,
+            seg_ctx,
+            rjetty,
         }
     }
 
-    pub fn to_pair(self) -> (SegDesc, JettyId) {
+    pub fn to_pair(&self) -> (SegDesc, JettyId) {
         (
             SegDesc {
                 eid: Eid(self.eid),
@@ -188,6 +197,50 @@ impl PeerDesc {
     }
 }
 
+/* ============================== peer import ============================== */
+
+/// `Peer::import_ctx` with a bounded retry for the kernel-exchange class of
+/// failure. The blob import on bonding skips the kernel-side seg/jetty
+/// exchange, so errno ENOEXEC should no longer occur; the retry stays as
+/// cheap insurance for mixed-version peers still publishing plain
+/// descriptors. The remaining failure class is the stale per-process
+/// topology snapshot (import_jetty "Failed to find connected port").
+pub fn import_peer(ctx: &Context, desc: &PeerDesc) -> Result<Peer> {
+    /// ubagg maps any exchange failure to -ENOEXEC (ubagg_seg.c/ubagg_jetty.c)
+    const ENOEXEC: i32 = 8;
+    /// retry headroom: IMPORT_RETRIES x CONNECT_RETRY_S
+    const IMPORT_RETRIES: u32 = 30;
+    let mut attempt = 0;
+    loop {
+        match Peer::import_ctx(ctx, &desc.seg_ctx, &desc.rjetty, TOKEN_VALUE) {
+            Ok(p) => return Ok(p),
+            Err(Error::Null(_, ENOEXEC)) if attempt < IMPORT_RETRIES => {
+                if attempt == 0 {
+                    eprintln!(
+                        "[import] kernel-side info exchange with the peer failed (errno \
+                         {ENOEXEC}); retrying up to {IMPORT_RETRIES}s (with blob \
+                         descriptors this points at a stale/empty blob or a mixed-version \
+                         peer)"
+                    );
+                }
+                attempt += 1;
+                std::thread::sleep(CONNECT_RETRY_S);
+            }
+            Err(e) => {
+                if !matches!(e, Error::Null(_, ENOEXEC)) {
+                    eprintln!(
+                        "[import] note: if the liburma log shows 'Failed to find connected \
+                         port', this process's topology snapshot predates the peer's links \
+                         (taken once per process, never refreshed); restarting this process \
+                         now that the peer is up resolves it"
+                    );
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /* ============================== URMA resource bundle ============================== */
 
 /// The full resource set for hello/ping-pong, bundled for convenience. Child
@@ -199,6 +252,10 @@ pub struct UrmaRes {
     pub cq: CompletionQueue,
     pub jetty: Jetty,
     pub buf: RegisteredBuf,
+    /// exported at create time (desc() is infallible); the bonding blobs let
+    /// the peer import without the kernel-side exchange
+    seg_ctx: Vec<u8>,
+    rjetty: Vec<u8>,
     _urma: Urma,
 }
 
@@ -216,6 +273,8 @@ impl UrmaRes {
             JettyOpts { multi_path: dev.starts_with("bonding"), ..Default::default() },
         )?;
         let mut buf = RegisteredBuf::new(&ctx, BUF_SIZE, TOKEN_VALUE)?;
+        let seg_ctx = buf.export_seg_ctx()?;
+        let rjetty = jetty.export_rjetty()?;
 
         buf[..MSG_SIZE].copy_from_slice(&msg[..MSG_SIZE]);
         println!(
@@ -223,12 +282,17 @@ impl UrmaRes {
             String::from_utf8_lossy(&msg[..cstr_len(&msg[..MSG_SIZE])])
         );
 
-        Ok(UrmaRes { ctx, cq, jetty, buf, _urma: urma })
+        Ok(UrmaRes { ctx, cq, jetty, buf, seg_ctx, rjetty, _urma: urma })
     }
 
     /// Public descriptor: announced to the peer / published to the directory
     pub fn desc(&self) -> PeerDesc {
-        PeerDesc::of(self.buf.descriptor(), self.jetty.id())
+        PeerDesc::of(
+            self.buf.descriptor(),
+            self.jetty.id(),
+            self.seg_ctx.clone(),
+            self.rjetty.clone(),
+        )
     }
 }
 

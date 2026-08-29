@@ -20,8 +20,8 @@ plus example demos.
 
 ```bash
 cargo build --examples      # lib + examples (linking needs liburma.so)
-cargo test                  # 6 guard tests (4 ffi ABI layout + Urma::init
-                            # idempotence + URMA_LOG_LEVEL mapping)
+cargo test                  # 5 guard tests (4 ffi ABI layout + Urma::init
+                            # idempotence)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
@@ -134,12 +134,14 @@ cargo clippy --examples
   SHARE_JFR). All examples route imports through `common::import_peer`,
   which uses the blob path; the plain-field `PeerDesc` members remain for
   logging and `check_loopback` only.
-- liburma's default log sink is syslog, so provider/driver errors never reach
-  the terminal. The examples call `urma_rs::enable_stderr_log_from_env()`
-  before creating resources to mirror `[urma:N] ...` lines to stderr.
-  `URMA_LOG_LEVEL` is the switch: `off` keeps the default syslog sink (quiet
-  terminal), `0`-`7` picks a `URMA_VLOG_LEVEL_*`, and unset/invalid keeps the
-  DEBUG default. NULL-returning FFI calls capture errno into
+- This crate has NO logging layer: the URMA libraries log to syslog
+  (facility `user`, `[URMA]` tag) on their own — liburma core honors
+  `urma_register_log_func` callbacks, but the tpsa provider (libuvs) always
+  writes to syslog directly, so the system log is the only complete source
+  and we do not wrap a partial mirror. Levels: `URMA_LOG_LEVEL` /
+  `UVS_LOG_LEVEL` env vars, STRING values (`fatal`/`error`/`warning`/`info`/
+  `debug`, default `info`), read once in the .so constructor. Full details:
+  `docs/logging.md`. NULL-returning FFI calls capture errno into
   `Error::Null(what, errno)` at the failure site.
 - `PageBuf` keeps 4KB alignment as cheap insurance (not required by the plain
   register path); use the `PAGE_SIZE` const, never a magic 4096.

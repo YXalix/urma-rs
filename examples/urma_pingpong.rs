@@ -39,9 +39,7 @@ use clap::Parser;
 use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
-use urma_rs::{
-    enable_stderr_log_from_env, Completion, CompletionQueue, Eid, POLL_INTERVAL, POLL_RETRIES,
-};
+use urma_rs::{Completion, CompletionQueue, Eid, POLL_INTERVAL, POLL_RETRIES};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -310,11 +308,6 @@ impl Args {
 }
 
 async fn run(args: &Args, dev: &str, name: &str) -> Result<()> {
-    if !args.tcp_hook {
-        /* provider/driver errors otherwise go to syslog only; URMA_LOG_LEVEL
-           is the switch (off / 0-7, default DEBUG) */
-        enable_stderr_log_from_env()?;
-    }
     let listen_port = args.listen_port.unwrap_or(args.port);
     let ping = fill_msg(&format!("ping from {name}"));
     let pong = fill_msg(&format!("pong from {name}"));

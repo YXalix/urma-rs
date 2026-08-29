@@ -48,3 +48,12 @@ The script builds the examples, deploys them to both nodes, and runs
 hello + pingpong + lookup across the pair (SKIPs when no node list is
 configured or a node has no device). See `examples/README.md` for running
 the demos by hand.
+
+## Logging
+
+The URMA libraries log to **syslog** (facility `user`, tagged `[URMA]`);
+this crate carries no logging code of its own. Errors already appear at the
+default level; for full detail set `URMA_LOG_LEVEL=debug` and
+`UVS_LOG_LEVEL=debug` before starting the process, then read
+`journalctl -f | grep '\[URMA\]'`. See `docs/logging.md` for the full
+mechanism (env vars, levels, rsyslog paths, kernel-side `dmesg`).

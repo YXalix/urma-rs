@@ -37,9 +37,6 @@
 //!   would deadlock (each waits for the other to publish first), and the
 //!   snapshot cannot be retaken later in the same process. 0 keeps the
 //!   historical create-on-first-reply behavior.
-//! - `URMA_LOG_LEVEL`: switch for the liburma-to-stderr log mirror — `off`
-//!   keeps the library on its default syslog sink (quiet terminal), `0`-`7`
-//!   picks a `URMA_VLOG_LEVEL_*`, unset keeps DEBUG.
 //!
 //! Usage (run on both nodes at once, each pointing at the other's IP; the client
 //! retries forever, so start order doesn't matter):
@@ -59,7 +56,7 @@ use clap::Parser;
 use tokio::sync::{watch, Notify};
 
 use urma_rs::error::{Error, Result};
-use urma_rs::{enable_stderr_log_from_env, Eid};
+use urma_rs::Eid;
 
 #[path = "common/mod.rs"]
 mod common;
@@ -352,8 +349,8 @@ Environment:
   HELLO_RES_DELAY_MS=<n>  defer the once-per-process topology snapshot by n ms
                           after the peer first answers (import-crash experiment;
                           0 = create resources on the peer's first reply)
-  URMA_LOG_LEVEL=off|0-7  liburma log mirror to stderr; off = default syslog
-                          sink only, unset = DEBUG)"
+
+URMA library logs go to syslog; see docs/logging.md for how to read them."
 )]
 struct Args {
     /// URMA device, e.g. udma2 / bonding_dev_0 (see examples/list_devices)
@@ -395,11 +392,6 @@ impl Args {
 }
 
 async fn run(args: &Args, dev: &str, name: &str) -> Result<()> {
-    if !args.tcp_hook {
-        /* provider/driver errors otherwise go to syslog only; URMA_LOG_LEVEL
-           is the switch (off / 0-7, default DEBUG) */
-        enable_stderr_log_from_env()?;
-    }
     let listen_port = args.listen_port.unwrap_or(args.port);
     let msg = fill_msg(&format!("hello world from {name}"));
     combined(args, dev, &msg, listen_port).await

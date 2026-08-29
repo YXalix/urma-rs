@@ -16,9 +16,8 @@ pub mod ffi;
 pub mod urma;
 
 pub use error::{Error, Result};
-pub use ffi::URMA_VLOG_LEVEL_DEBUG as LOG_LEVEL_DEBUG;
 pub use urma::{
-    enable_stderr_log, enable_stderr_log_from_env, list_devices, Completion, CompletionQueue,
-    Context, Eid, Jetty, JettyId, JettyOpts, LocalSge, PageBuf, Peer, RegisteredBuf, RegisteredSeg,
-    SegDesc, Urma, DEFAULT_DEPTH, PAGE_SIZE, POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE,
+    list_devices, Completion, CompletionQueue, Context, Eid, Jetty, JettyId, JettyOpts, LocalSge,
+    PageBuf, Peer, RegisteredBuf, RegisteredSeg, SegDesc, Urma, DEFAULT_DEPTH, PAGE_SIZE,
+    POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE,
 };

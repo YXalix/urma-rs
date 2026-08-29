@@ -27,55 +27,6 @@ fn null_err(what: &'static str) -> Error {
     Error::Null(what, std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
-/// Route urma library logs (core + all providers) to stderr. The default sink
-/// is syslog, which hides provider/driver errors from the terminal; call this
-/// before creating resources. `level` is one of the `ffi::URMA_VLOG_LEVEL_*`
-/// values — DEBUG surfaces the import-path details (which port pair failed,
-/// ioctl errno, topology lookups).
-pub fn enable_stderr_log(level: i32) -> Result<()> {
-    unsafe extern "C" fn log_cb(level: i32, message: *mut std::os::raw::c_char) {
-        if message.is_null() {
-            return;
-        }
-        let msg = unsafe { std::ffi::CStr::from_ptr(message) };
-        eprintln!("[urma:{level}] {}", msg.to_string_lossy());
-    }
-    unsafe {
-        ffi::urma_log_set_level(level);
-        check_status(ffi::urma_register_log_func(Some(log_cb)), "urma_register_log_func")
-    }
-}
-
-/// [`enable_stderr_log`] with the `URMA_LOG_LEVEL` env var as the switch, so a
-/// quiet run needs no code change: `off` (case-insensitive) keeps the library
-/// on its default syslog sink, `0`-`7` picks a `URMA_VLOG_LEVEL_*` mirror
-/// level, and unset, unparsable or out-of-range values keep the historical
-/// DEBUG default (losing real-device errors hurts more than extra noise).
-pub fn enable_stderr_log_from_env() -> Result<()> {
-    match stderr_level(std::env::var_os("URMA_LOG_LEVEL").as_deref()) {
-        None => Ok(()),
-        Some(level) => enable_stderr_log(level),
-    }
-}
-
-/// Resolve the env var's value to a mirror level; `None` = no stderr mirror.
-/// Takes the value instead of reading the env itself so tests can exercise
-/// the mapping without touching process state.
-fn stderr_level(value: Option<&std::ffi::OsStr>) -> Option<i32> {
-    let v = match value {
-        None => return Some(ffi::URMA_VLOG_LEVEL_DEBUG),
-        Some(v) => v.to_string_lossy(),
-    };
-    let v = v.trim();
-    if v.eq_ignore_ascii_case("off") {
-        return None;
-    }
-    match v.parse::<i32>() {
-        Ok(level) if (0..=7).contains(&level) => Some(level),
-        _ => Some(ffi::URMA_VLOG_LEVEL_DEBUG),
-    }
-}
-
 /// Plain token value agreed by both ends (security credential); this is the
 /// `urma_token_t` value, unrelated to the token-id mechanism (which stays
 /// disabled, see [`RegisteredSeg::register`])
@@ -1001,23 +952,5 @@ mod tests {
     fn init_is_idempotent_per_thread() {
         let _first = Urma::init().expect("first init");
         let _second = Urma::init().expect("second init must clone the guard, not hit URMA_EEXIST");
-    }
-
-    /// URMA_LOG_LEVEL drives the stderr mirror: `off` silences it (no callback
-    /// registered, default syslog sink), `0`-`7` picks the level, and anything
-    /// else — unset included — falls back to DEBUG so errors stay visible.
-    #[test]
-    fn log_level_env_mapping() {
-        use std::ffi::OsStr;
-        let dbg = ffi::URMA_VLOG_LEVEL_DEBUG;
-        assert_eq!(stderr_level(None), Some(dbg));
-        assert_eq!(stderr_level(Some(OsStr::new("off"))), None);
-        assert_eq!(stderr_level(Some(OsStr::new("OFF"))), None);
-        assert_eq!(stderr_level(Some(OsStr::new(" 0 "))), Some(0));
-        assert_eq!(stderr_level(Some(OsStr::new("3"))), Some(3));
-        assert_eq!(stderr_level(Some(OsStr::new("7"))), Some(dbg));
-        assert_eq!(stderr_level(Some(OsStr::new("8"))), Some(dbg));
-        assert_eq!(stderr_level(Some(OsStr::new("bogus"))), Some(dbg));
-        assert_eq!(stderr_level(Some(OsStr::new(""))), Some(dbg));
     }
 }

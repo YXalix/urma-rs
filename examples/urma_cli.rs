@@ -93,7 +93,7 @@ struct ModeArgs {
     /// tp type the reading side chooses at import
     #[arg(long, default_value = "ctp")]
     tp: TpArg,
-    /// multi-path (bonding devices force this on regardless)
+    /// multi-path (bonding devices force it on unless the cap probe says no)
     #[arg(long)]
     multi_path: bool,
 }
@@ -225,27 +225,38 @@ fn list_run(caps: bool) -> Result<()> {
 fn preflight(m: &ModeArgs) -> Result<(TransMode, TpType, bool)> {
     let mode = m.mode.get();
     let tp = m.tp.get();
-    let multi_path = m.multi_path || m.dev.starts_with("bonding");
+    let mut multi_path = m.multi_path || m.dev.starts_with("bonding");
     let cap = query_device(&m.dev)?;
 
     let mut missing = Vec::new();
     if !cap.supports_mode(mode) {
         missing.push(format!("transport mode {}", mode.name()));
-    } else {
-        if !cap.supports(mode, tp) {
-            missing.push(format!(
-                "tp type {} for {}{}",
-                tp.name(),
-                mode.name(),
-                if tp == TpType::Ctp && cap.tp_cap(mode).ctp && !cap.ctp_en {
-                    " (the mode allows CTP but the device feature ctp_en is off)"
-                } else {
-                    ""
-                }
-            ));
-        }
-        if multi_path && !cap.supports_multi_path(mode) {
+    } else if !cap.supports(mode, tp) {
+        missing.push(format!(
+            "tp type {} for {}{}",
+            tp.name(),
+            mode.name(),
+            if tp == TpType::Ctp && cap.tp_cap(mode).ctp && !cap.ctp_en {
+                " (the mode allows CTP but the device feature ctp_en is off)"
+            } else {
+                ""
+            }
+        ));
+    }
+    /* Bonding devices normally force multi-path on, but the cap bit comes
+       straight from the NIC driver's registered attrs (the kernel never
+       derives it) and some drivers leave it 0 even though single-path RM
+       works — fall back instead of failing before any resource exists. */
+    if multi_path && !cap.supports_multi_path(mode) {
+        if m.multi_path {
             missing.push(format!("multi-path for {}", mode.name()));
+        } else {
+            multi_path = false;
+            println!(
+                "[mode] note: {} does not report multi-path capability for {}; using single-path",
+                m.dev,
+                mode.name()
+            );
         }
     }
     println!(

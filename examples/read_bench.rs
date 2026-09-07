@@ -19,14 +19,32 @@
 //!
 //! `read-urma --depth N` (default 1) switches the URMA side from the
 //! serialized latency measurement to a pipelined bandwidth one, in
-//! urma_perftest read_bw's style: up to N READs in flight, post-one /
-//! reap-one. Both transfer ends rotate through their disjoint windows per
-//! op — the landing buffer is registered at size×depth when memory allows
-//! (capped at 1 GiB, with a note when the cap bites), and the remote side
-//! cycles the peer's segment, so start serve-urma with a `--buf-len` above
-//! the sweep max to widen the remote rotation too; hammering one address
-//! range saturates that memory region, not the link. Reported per size
-//! instead of the latency percentiles: average BW over the whole
+//! urma_perftest read_bw's style: up to N READs in flight, post-burst /
+//! batch-reap. Saturating a link needs `depth × size` above the fabric's
+//! bandwidth-latency product — 64 outstanding 4K READs are 256 KiB in
+//! flight, well under a 400G-class fabric's BDP, so `--depth` is bounded
+//! only by the device's per-queue ceilings (jfs/jfc/jfr depth caps from
+//! `query_device`; the queues are created at the requested depth) and small
+//! sizes need depths in the hundreds to fill the pipe. Two more perftest
+//! mechanics keep the reader's own CPU from becoming the bottleneck at
+//! small sizes, where line rate means millions of ops/s:
+//! completions are reaped `urma_poll_jfc`-batched (one CQ lock + software
+//! doorbell per batch, not per record), and `--cq-mod m` posts only every
+//! m-th READ with a completion record (CQ moderation; default 0 = auto:
+//! min(100, depth) for sizes ≤ 8 KiB, 1 above — per-op completion
+//! processing is exactly what caps a 4K ops-rate sweep). Signaled READs
+//! carry comp_order, so each record proves every earlier op completed, and
+//! a window ending on an unsignaled tail is closed by one extra 1-byte
+//! fence READ whose record is not counted; op accounting is therefore
+//! exact at any moderation.
+//! Both transfer ends rotate through their windows per op — the landing
+//! buffer is registered at size×depth (`--landing-cap` ceiling, default
+//! 1 GiB, with an overlap note when it bites), and the remote side cycles
+//! the peer's segment, so start serve-urma with a `--buf-len` above
+//! sweep-max × depth to widen that rotation too (a note fires when the
+//! remote windows are fewer than the depth); hammering one address range
+//! saturates that memory region, not the link. Reported per size instead
+//! of the latency percentiles: average BW over the whole
 //! first-post→last-completion window and Mops. There is deliberately no
 //! peak column: in a full pipeline every per-op post→completion window
 //! contains queueing time, so a "fastest op" is pipeline noise, not a
@@ -47,10 +65,11 @@
 //! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
 //!         --sizes 8..16m   # serve sizes its buffer to the sweep's maximum
 //!
-//! # URMA READ bandwidth: same sweep, pipelined depth (perftest read_bw style):
-//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m --buf-len 64m
+//! # URMA READ bandwidth: same sweep, pipelined depth (perftest read_bw style).
+//! # Small sizes need a deep pipeline + CQ moderation to reach line rate:
+//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m --buf-len 512m
 //! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
-//!         --sizes 4k..1m --depth 32 --duration 10
+//!         --sizes 4k..1m --depth 512 --duration 10
 //!
 //! # TCP reference over the same pair of machines:
 //! nodeA$ cargo run --example read_bench -- serve-tcp
@@ -89,7 +108,21 @@ const DEFAULT_BUF_LEN: usize = 1048576;
 const BW_WARMUP: Duration = Duration::from_secs(1);
 /// landing-buffer ceiling for bandwidth mode (size x depth, capped): keeps a
 /// 16m x 64-style sweep from demanding GiBs of registered memory
+/// (override with --landing-cap on machines with memory to spare)
 const BW_LANDING_CAP: usize = 1 << 30;
+/// completions reaped per urma_poll_jfc call in bandwidth mode: one call
+/// takes the provider's CQ lock and writes its software doorbell once, so
+/// batches amortize both (perftest's PERFTEST_POLL_BATCH is 16)
+const BW_POLL_BATCH: usize = 16;
+/// auto --cq-mod group size / the size it applies to (perftest's
+/// PERFTEST_DEF_CQ_NUM / PERFTEST_SIZE_CQ_MOD_LIMIT): above 8 KiB the
+/// completion rate is low enough that moderation would only blur the
+/// window's end, so it turns itself off
+const BW_CQ_MOD_AUTO: u64 = 100;
+const BW_CQ_MOD_LIMIT: usize = 8192;
+/// user_ctx of the bandwidth fence READ (never a real op index: those are
+/// 0..posts); its completion record covers an unsignaled tail
+const BW_FENCE_CTX: u64 = u64::MAX;
 
 #[derive(Parser)]
 #[command(
@@ -103,9 +136,11 @@ const BW_LANDING_CAP: usize = 1 << 30;
                   TCP has no one-sided op, so a read is emulated as a 4-byte length request + \
                   N-byte response round trip. Both transports share the sweep, the verify pass \
                   and the warmup. read-urma --depth>1 switches the URMA side to a pipelined \
-                  bandwidth measurement (urma_perftest read_bw's measurement, both transfer \
-                  ends rotating their windows; --duration for stable long windows). \
-                  scripts/test_readbench.sh runs the full matrix."
+                  bandwidth measurement (urma_perftest read_bw's measurement: both transfer \
+                  ends rotating their windows, batched completion reaping, --cq-mod completion \
+                  moderation for small sizes, depth bounded by the device's queue caps; \
+                  --duration for stable long windows). scripts/test_readbench.sh runs the \
+                  full matrix."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -156,7 +191,8 @@ struct BenchArgs {
     #[arg(long, default_value_t = 100)]
     warmup: u32,
     /// print csv rows instead of the table (schema in the header line:
-    /// latency percentiles, or ops/depth/bw_avg_mib/mops in bandwidth mode)
+    /// latency percentiles, or ops/depth/cq_mod/bw_avg_mib/mops in
+    /// bandwidth mode)
     #[arg(long)]
     csv: bool,
 }
@@ -184,9 +220,26 @@ struct ReadUrmaArgs {
     bench: BenchArgs,
     /// outstanding READs: 1 = latency mode (serialized, default); >1 = bandwidth
     /// mode - up to this many READs in flight, reported as avg MiB/s + Mops
-    /// instead of latency percentiles (bounded by the jetty/CQ depth, 64)
+    /// instead of latency percentiles; bounded by the device's jfs/jfc/jfr
+    /// depth caps (the queues are created at the requested depth - small
+    /// sizes need depth x size above the fabric's bandwidth-latency product,
+    /// i.e. hundreds at 4K on fast fabrics)
     #[arg(long, default_value_t = 1)]
     depth: u32,
+    /// CQ moderation, bandwidth mode only: only every Nth READ generates a
+    /// completion record (N is clamped to 1..=depth; perftest's cq_mod).
+    /// 0 = auto: min(100, depth) for sizes <= 8k - per-op completion
+    /// processing is what caps the ops rate at small sizes - and 1 above.
+    /// Window/op accounting stays exact: a signaled READ is comp-ordered, and
+    /// a tail without a record is closed by a 1-byte fence READ
+    #[arg(long, default_value_t = 0)]
+    cq_mod: u64,
+    /// landing-buffer ceiling for bandwidth mode, bytes (plain or k/m/g
+    /// suffixes); size x depth is capped here (default 1g) with overlapping
+    /// landing windows when it bites - raise it for disjoint landings at
+    /// big size x depth
+    #[arg(long, value_parser = parse_buf_len)]
+    landing_cap: Option<usize>,
     /// timed window per size in seconds, bandwidth mode only (0 = off): each
     /// size runs to this deadline instead of --iters ops, then the in-flight
     /// READs drain - a window long enough that one scheduler hiccup cannot
@@ -329,16 +382,20 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
 
 fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     let mut sizes = bench_sizes(&a.bench)?;
-    if a.depth == 0 || a.depth > DEFAULT_DEPTH {
-        return Err(Error::Invalid(format!(
-            "--depth must be 1..={DEFAULT_DEPTH}: the jetty/CQ are created at DEFAULT_DEPTH, \
-             more outstanding READs than that would overflow the queues"
-        )));
+    if a.depth == 0 {
+        return Err(Error::Invalid("--depth must be at least 1".into()));
     }
     if a.duration > 0 && a.depth == 1 {
         return Err(Error::Invalid(
             "--duration needs bandwidth mode: pass --depth > 1 (latency mode counts iterations, \
              not seconds)"
+                .into(),
+        ));
+    }
+    if a.cq_mod > 0 && a.depth == 1 {
+        return Err(Error::Invalid(
+            "--cq-mod needs bandwidth mode: pass --depth > 1 (a serialized READ cannot skip \
+             completion records)"
                 .into(),
         ));
     }
@@ -359,6 +416,25 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     );
 
     let (mode, tp, multi_path, cap) = preflight(&a.mode)?;
+    /* depth is bounded by the device's per-queue ceilings only (a 0 cap
+       field = not reported, ignored): the CQ/jetty below are created at the
+       requested depth, because saturating small sizes needs depth x size
+       above the fabric's bandwidth-latency product — far more than 64
+       outstanding 4K READs on a fast fabric */
+    let depth_limit = [cap.max_jfs_depth, cap.max_jfc_depth, cap.max_jfr_depth]
+        .into_iter()
+        .filter(|&c| c > 0)
+        .map(u64::from)
+        .min()
+        .unwrap_or(u64::from(DEFAULT_DEPTH));
+    if u64::from(a.depth) > depth_limit {
+        return Err(Error::Invalid(format!(
+            "--depth {} exceeds the device's queue ceilings (jfs {} / jfc {} / jfr {}); \
+             use at most {depth_limit}",
+            a.depth, cap.max_jfs_depth, cap.max_jfc_depth, cap.max_jfr_depth
+        )));
+    }
+    let qdepth = a.depth.max(DEFAULT_DEPTH);
     /* sizes above the READ ceiling are skipped with a note, not fatal: one
        sweep then works on any device. A one-sided READ is bounded by the
        device's max_read_size — max_msg_size caps two-sided messages, not
@@ -398,10 +474,13 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
         ));
     }
 
-    println!("[2/4] own completion queue + jetty (the READ is posted from our jetty)");
-    let cq = CompletionQueue::new(&ctx, DEFAULT_DEPTH)?;
-    let jetty =
-        Jetty::new(&ctx, &cq, JettyOpts { trans_mode: mode, multi_path, ..Default::default() })?;
+    println!("[2/4] own completion queue + jetty at depth {qdepth} (the READ is posted from our jetty)");
+    let cq = CompletionQueue::new(&ctx, qdepth)?;
+    let jetty = Jetty::new(
+        &ctx,
+        &cq,
+        JettyOpts { depth: qdepth, trans_mode: mode, multi_path, ..Default::default() },
+    )?;
     println!("      jetty id {} uasid {:#x}", jetty.id().id, jetty.id().uasid);
 
     println!("[3/4] import peer via blobs ({tp})");
@@ -410,14 +489,26 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     let max_size = *sizes.last().unwrap();
     /* bandwidth mode registers size x depth of landing (capped) so the
        pipeline gets disjoint landing windows; the remote end rotates the
-       peer's segment — give serve-urma a --buf-len above the sweep max to
-       widen that rotation too */
+       peer's segment — give serve-urma a --buf-len above sweep-max x depth
+       to widen that rotation too: fewer remote windows than the depth means
+       concurrent READs hammer one remote range and the measurement
+       saturates that memory, not the link */
     let landing_len = if a.depth > 1 {
         let want = max_size.saturating_mul(a.depth as usize);
-        let capped = want.min(BW_LANDING_CAP);
+        let capped = want.min(a.landing_cap.unwrap_or(BW_LANDING_CAP));
         if capped < want {
+            let windows = (capped / max_size).max(1);
             println!(
-                "[read-urma] note: landing capped at {capped} bytes ({max_size} x depth {} would be {want}); the top sizes overlap windows",
+                "[read-urma] note: landing capped at {capped} bytes ({max_size} x depth {} would be {want}); \
+                 the {} in-flight READs share {windows} landing windows - raise --landing-cap for disjoint landings",
+                a.depth, a.depth
+            );
+        }
+        let remote_windows = wire.seg.len / max_size as u64;
+        if remote_windows < u64::from(a.depth) {
+            println!(
+                "[read-urma] note: remote rotation covers {remote_windows} x {max_size}-byte windows, \
+                 below depth {} - raise serve-urma --buf-len so concurrent READs do not hammer one remote range",
                 a.depth
             );
         }
@@ -458,6 +549,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
             )?;
             print_row("urma", size, a.bench.iters, &s, a.bench.csv);
         } else {
+            let m = resolve_cq_mod(a.cq_mod, size, a.depth);
             let bw = BwCtx {
                 jetty: &jetty,
                 cq: &cq,
@@ -466,8 +558,9 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
                 seg_len: wire.seg.len,
                 landing: &landing,
             };
-            let s = run_bw_iters(&bw, size, a.depth, a.bench.warmup, a.bench.iters, duration)?;
-            print_bw_row("urma", size, a.depth, &s, a.bench.csv);
+            let s =
+                run_bw_iters(&bw, size, a.depth, m, a.bench.warmup, a.bench.iters, duration)?;
+            print_bw_row("urma", size, a.depth, m, &s, a.bench.csv);
         }
     }
     let per = if a.depth > 1 && a.duration > 0 {
@@ -541,8 +634,15 @@ impl BwStop {
 }
 
 /// one pipelined pass: post while the pipeline is not full and the stop
-/// condition allows, reap completions as they land (each one frees a slot
-/// for the next post). A timed pass returns its whole
+/// condition allows, reap completions in `BW_POLL_BATCH` batches as they
+/// land (each one frees slots for the next posts). Ops are posted with
+/// `user_ctx = op index`; with CQ moderation `cq_mod = m` only every m-th
+/// op is signaled, and a signaled READ carries comp_order, so a completion
+/// record advances the done count to `user_ctx + 1` — proof, not
+/// assumption. A pass that stops on an unsignaled tail posts one extra
+/// 1-byte signaled fence READ (`BW_FENCE_CTX`) whose record closes the
+/// window; the fence byte is not counted, so op/byte accounting is exact at
+/// any moderation. A timed pass returns its whole
 /// first-post→last-completion window plus the completed-op count.
 /// Completions only need counting — no per-op timestamps: in a full
 /// pipeline every post→completion window contains queueing time, so per-op
@@ -550,41 +650,98 @@ impl BwStop {
 /// on every completion: it bounds silence, not the pass (a duration pass
 /// runs long by design).
 fn bw_pass(
-    bw: &BwCtx, size: usize, depth: u32, stop: &BwStop, timed: bool,
+    bw: &BwCtx, size: usize, depth: u32, cq_mod: u64, stop: &BwStop, timed: bool,
 ) -> Result<Option<(Duration, u64)>> {
     let (mut next, mut done) = (0u64, 0u64);
+    let mut fenced = false;
     let mut t0 = None;
     let mut deadline = Instant::now() + READ_TIMEOUT;
+    let mut crs = [Completion { status: 0, user_ctx: 0, completion_len: 0 }; BW_POLL_BATCH];
     loop {
         while !stop.stop_posting(next) && next - done < u64::from(depth) {
             let off = bw_slot_off(next, size, bw.landing.len());
             let va = bw.remote_va + bw_slot_off(next, size, bw.seg_len as usize) as u64;
-            bw.jetty.post_read(bw.peer, va, &[bw.landing.sge(off, size as u32)?], READ_CTX)?;
+            let signaled = (next + 1) % cq_mod == 0;
+            bw.jetty.post_read_signaled(
+                bw.peer,
+                va,
+                &[bw.landing.sge(off, size as u32)?],
+                next,
+                signaled,
+            )?;
             if timed && next == 0 {
                 t0 = Some(Instant::now());
             }
             next += 1;
         }
+        /* posting has stopped on an unsignaled tail: once a queue slot frees
+           up, fence the pipeline so the window can still end on a record
+           that proves every posted op completed */
+        if !fenced
+            && next > 0
+            && bw_tail_uncovered(next, cq_mod)
+            && stop.stop_posting(next)
+            && next - done < u64::from(depth)
+        {
+            bw.jetty.post_read_signaled(
+                bw.peer,
+                bw.remote_va,
+                &[bw.landing.sge(0, 1)?],
+                BW_FENCE_CTX,
+                true,
+            )?;
+            fenced = true;
+        }
         if done == next && stop.stop_posting(next) {
             break;
         }
-        match bw.cq.poll()? {
-            Some(cr) => {
-                if !cr.is_success() {
-                    return Err(Error::BadCompletion { status: cr.status, user_ctx: cr.user_ctx });
-                }
-                done += 1;
-                deadline = Instant::now() + READ_TIMEOUT;
+        let n = bw.cq.poll_batch(&mut crs)?;
+        if n == 0 {
+            if Instant::now() >= deadline {
+                return Err(Error::PollTimeout { user_ctx: next });
             }
-            None => {
-                if Instant::now() >= deadline {
-                    return Err(Error::PollTimeout { user_ctx: next });
-                }
-                std::hint::spin_loop();
+            std::hint::spin_loop();
+            continue;
+        }
+        for cr in &crs[..n] {
+            if !cr.is_success() {
+                return Err(Error::BadCompletion { status: cr.status, user_ctx: cr.user_ctx });
             }
+            done = if cr.user_ctx == BW_FENCE_CTX {
+                next /* the fence record covers every posted op */
+            } else {
+                done.max(cr.user_ctx + 1)
+            };
+            deadline = Instant::now() + READ_TIMEOUT;
         }
     }
     Ok(t0.map(|t0| (t0.elapsed(), done)))
+}
+
+/// effective CQ moderation for one size: 0 (default) = auto — perftest's
+/// rule of min(100, depth) for sizes up to `BW_CQ_MOD_LIMIT` (per-op
+/// completion processing is what caps the ops rate at small sizes; a
+/// record per 100 ops removes that ceiling) and 1 (every op) above, where
+/// completions are sparse anyway and moderation would only blur the
+/// window's end. An explicit value overrides the rule, clamped to
+/// 1..=depth (perftest clamps cq_mod to the queue depth too).
+fn resolve_cq_mod(flag: u64, size: usize, depth: u32) -> u64 {
+    if flag == 0 {
+        if size <= BW_CQ_MOD_LIMIT {
+            BW_CQ_MOD_AUTO.min(u64::from(depth))
+        } else {
+            1
+        }
+    } else {
+        flag.clamp(1, u64::from(depth))
+    }
+}
+
+/// whether the first `posts` ops end on an unsignaled one — the tail a
+/// fence READ must cover: moderation on, and the posts not a whole number
+/// of groups
+fn bw_tail_uncovered(posts: u64, cq_mod: u64) -> bool {
+    cq_mod > 1 && !posts.is_multiple_of(cq_mod)
 }
 
 /// bandwidth counterpart of `run_iters`: an untimed warmup pass, then the
@@ -592,7 +749,8 @@ fn bw_pass(
 /// fixed 1s and then runs to a seconds-long deadline — a window long enough
 /// that one scheduler hiccup cannot dominate the average.
 fn run_bw_iters(
-    bw: &BwCtx, size: usize, depth: u32, warmup: u32, iters: u32, duration: Option<u64>,
+    bw: &BwCtx, size: usize, depth: u32, cq_mod: u64, warmup: u32, iters: u32,
+    duration: Option<u64>,
 ) -> Result<BwStats> {
     let (warm_stop, main_stop) = match duration {
         Some(secs) => (
@@ -602,10 +760,10 @@ fn run_bw_iters(
         None => (BwStop::Ops(u64::from(warmup)), BwStop::Ops(u64::from(iters))),
     };
     if matches!(warm_stop, BwStop::Ops(n) if n > 0) {
-        bw_pass(bw, size, depth, &warm_stop, false)?;
+        bw_pass(bw, size, depth, cq_mod, &warm_stop, false)?;
     }
-    let (window, ops) =
-        bw_pass(bw, size, depth, &main_stop, true)?.expect("timed pass posts at least one op");
+    let (window, ops) = bw_pass(bw, size, depth, cq_mod, &main_stop, true)?
+        .expect("timed pass posts at least one op");
     Ok(bw_stats(size, ops, window))
 }
 
@@ -912,7 +1070,7 @@ fn bw_stats(size: usize, ops: u64, total: Duration) -> BwStats {
 fn print_header(transport: &str, iters: u32, warmup: u32, depth: u32, duration: u64, csv: bool) {
     if csv {
         if depth > 1 {
-            println!("csv,transport,size_bytes,ops,depth,bw_avg_mib,mops");
+            println!("csv,transport,size_bytes,ops,depth,cq_mod,bw_avg_mib,mops");
         } else {
             println!("csv,transport,size_bytes,iters,min_us,p50_us,avg_us,p99_us,max_us");
         }
@@ -923,7 +1081,7 @@ fn print_header(transport: &str, iters: u32, warmup: u32, depth: u32, duration: 
             format!("{iters} iters + {warmup} warmup")
         };
         println!("== {transport} READ bandwidth: depth {depth}, {mode} per size, MiB/s ==");
-        println!("{:>10} {:>10} {:>10}", "size", "avg", "Mops");
+        println!("{:>10} {:>7} {:>10} {:>10}", "size", "cq-mod", "avg", "Mops");
     } else {
         println!("== {transport} READ latency: {iters} iters + {warmup} warmup per size, µs ==");
         println!("{:>10} {:>10} {:>10} {:>10} {:>10} {:>10}", "size", "min", "p50", "avg", "p99", "max");
@@ -941,11 +1099,11 @@ fn print_row(transport: &str, size: usize, iters: u32, s: &Stats, csv: bool) {
     }
 }
 
-fn print_bw_row(transport: &str, size: usize, depth: u32, s: &BwStats, csv: bool) {
+fn print_bw_row(transport: &str, size: usize, depth: u32, cq_mod: u64, s: &BwStats, csv: bool) {
     if csv {
-        println!("csv,{transport},{size},{},{depth},{:.2},{:.3}", s.ops, s.avg, s.mops);
+        println!("csv,{transport},{size},{},{depth},{cq_mod},{:.2},{:.3}", s.ops, s.avg, s.mops);
     } else {
-        println!("{:>10} {:>10.2} {:>10.3}", size, s.avg, s.mops);
+        println!("{:>10} {:>7} {:>10.2} {:>10.3}", size, cq_mod, s.avg, s.mops);
     }
 }
 
@@ -1199,5 +1357,29 @@ mod tests {
             let off = bw_slot_off(i, 1000, 4096);
             assert!(off + 1000 <= 4096);
         }
+    }
+
+    #[test]
+    fn bw_cq_mod_resolution() {
+        /* auto: small sizes moderate at min(100, depth), the threshold is
+           inclusive, large sizes turn moderation off */
+        assert_eq!(resolve_cq_mod(0, 4096, 64), 64);
+        assert_eq!(resolve_cq_mod(0, 4096, 512), 100);
+        assert_eq!(resolve_cq_mod(0, BW_CQ_MOD_LIMIT, 512), 100);
+        assert_eq!(resolve_cq_mod(0, BW_CQ_MOD_LIMIT + 1, 64), 1);
+        assert_eq!(resolve_cq_mod(0, 1 << 20, 512), 1);
+        /* explicit: clamped to 1..=depth, and beats the size rule */
+        assert_eq!(resolve_cq_mod(1, 4096, 64), 1);
+        assert_eq!(resolve_cq_mod(1000, 4096, 64), 64);
+        assert_eq!(resolve_cq_mod(8, 1 << 20, 64), 8);
+    }
+
+    #[test]
+    fn bw_fence_tail_rule() {
+        assert!(!bw_tail_uncovered(1000, 1)); /* moderation off: every op signaled */
+        assert!(!bw_tail_uncovered(1000, 100)); /* whole groups: last op signaled */
+        assert!(bw_tail_uncovered(1050, 100)); /* 50-op tail left unsignaled */
+        assert!(bw_tail_uncovered(1, 100)); /* a single op with moderation on */
+        assert!(!bw_tail_uncovered(0, 100)); /* nothing posted: nothing to cover */
     }
 }

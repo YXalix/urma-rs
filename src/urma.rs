@@ -323,6 +323,12 @@ pub struct DeviceCap {
     pub max_jfr_sge: u32,
     /// Max message size in bytes (two-sided SEND/RECV messages)
     pub max_msg_size: u64,
+    /// Per-queue outstanding-op ceilings: work requests per jfs, recv buffers
+    /// per jfr, completion records per jfc (0 = not reported by the provider).
+    /// A pipelined benchmark's outstanding-op count is bounded by these.
+    pub max_jfs_depth: u32,
+    pub max_jfr_depth: u32,
+    pub max_jfc_depth: u32,
     /// Max bytes of one one-sided READ (0 = not reported by the provider)
     pub max_read_size: u64,
     /// Max bytes of one one-sided WRITE (0 = not reported by the provider)
@@ -368,6 +374,9 @@ impl DeviceCap {
             max_jfs_sge: cap.max_jfs_sge,
             max_jfr_sge: cap.max_jfr_sge,
             max_msg_size: cap.max_msg_size,
+            max_jfs_depth: cap.max_jfs_depth,
+            max_jfr_depth: cap.max_jfr_depth,
+            max_jfc_depth: cap.max_jfc_depth,
             max_read_size: cap.max_read_size as u64,
             max_write_size: cap.max_write_size as u64,
             page_size_cap: cap.page_size_cap,
@@ -643,6 +652,32 @@ impl CompletionQueue {
         }))
     }
 
+    /// Non-blocking batch poll: reaps up to `out.len()` completion records
+    /// into `out`, returning how many landed (0 = none yet). One call takes
+    /// the provider's CQ lock and updates its software doorbell once, so at
+    /// high completion rates (bandwidth loops) reaping in batches is much
+    /// cheaper than one [`CompletionQueue::poll`] per record.
+    pub fn poll_batch(&self, out: &mut [Completion]) -> Result<usize> {
+        const MAX: usize = 64;
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut raw = [ffi::urma_cr_t::default(); MAX];
+        let want = out.len().min(MAX);
+        let n = unsafe { ffi::urma_poll_jfc(self.jfc(), want as i32, raw.as_mut_ptr()) };
+        if n < 0 {
+            return Err(Error::Status(n, "urma_poll_jfc"));
+        }
+        for (dst, cr) in out.iter_mut().zip(raw.iter()).take(n as usize) {
+            *dst = Completion {
+                status: cr.status,
+                user_ctx: cr.user_ctx,
+                completion_len: cr.completion_len,
+            };
+        }
+        Ok(n as usize)
+    }
+
     /// Poll until the success completion record for the given user_ctx arrives
     pub fn wait_read(&self, expected_ctx: u64) -> Result<Completion> {
         for _ in 0..POLL_RETRIES {
@@ -808,6 +843,27 @@ impl Jetty {
         local: &[LocalSge],
         user_ctx: u64,
     ) -> Result<()> {
+        self.post_read_signaled(peer, remote_va, local, user_ctx, true)
+    }
+
+    /// [`Jetty::post_read`] with control over the completion record:
+    /// `signaled = false` clears `URMA_JFS_WR_FLAG_COMPLETE_ENABLE` (CQ
+    /// moderation, perftest's cq_mod). A signaled READ additionally sets
+    /// `comp_order`, binding its completion record to the previous work
+    /// request's: the record proves every earlier op on this jetty —
+    /// including unsignaled ones — has completed. Bandwidth loops exploit
+    /// that to cut the per-op completion cost at small message sizes,
+    /// ending each window with a signaled op that covers the unsignaled
+    /// tail. `place_order`/`fence` (execution ordering) stay off: they
+    /// would serialize the READs themselves.
+    pub fn post_read_signaled(
+        &self,
+        peer: &Peer,
+        remote_va: u64,
+        local: &[LocalSge],
+        user_ctx: u64,
+        signaled: bool,
+    ) -> Result<()> {
         let mut local_sges = self.check_local(local)?;
         let total = local
             .iter()
@@ -826,7 +882,13 @@ impl Jetty {
 
         let mut wr = ffi::urma_jfs_wr_t {
             opcode: ffi::URMA_OPC_READ,
-            flag: ffi::urma_jfs_wr_flag_t { value: ffi::URMA_JFS_WR_FLAG_COMPLETE_ENABLE },
+            flag: ffi::urma_jfs_wr_flag_t {
+                value: if signaled {
+                    ffi::URMA_JFS_WR_FLAG_COMPLETE_ENABLE | ffi::URMA_JFS_WR_FLAG_COMP_ORDER
+                } else {
+                    0
+                },
+            },
             tjetty: peer.tjetty.as_ptr(),
             user_ctx,
             rw,

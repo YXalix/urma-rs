@@ -126,6 +126,8 @@ pub const URMA_JFS_FLAG_MULTI_PATH: u32 = 1 << 11;
 
 /// Bits of urma_jfs_wr_flag_t: complete_enable is bit5
 pub const URMA_JFS_WR_FLAG_COMPLETE_ENABLE: u32 = 1 << 5;
+/// comp_order is bit2 (after place_order:2): completion order with previous WR
+pub const URMA_JFS_WR_FLAG_COMP_ORDER: u32 = 1 << 2;
 
 /// urma_status_t (function return value)
 pub type urma_status_t = c_int;
@@ -976,6 +978,9 @@ mod tests {
 
         // urma_device_cap_t: u64 fields force the padding at 52..56 and
         // 124..128; the per-mode caps sit behind the scalar tail
+        assert_eq!(offset_of!(urma_device_cap_t, max_jfc_depth), 28);
+        assert_eq!(offset_of!(urma_device_cap_t, max_jfs_depth), 32);
+        assert_eq!(offset_of!(urma_device_cap_t, max_jfr_depth), 36);
         assert_eq!(offset_of!(urma_device_cap_t, max_msg_size), 56);
         assert_eq!(offset_of!(urma_device_cap_t, max_read_size), 64);
         assert_eq!(offset_of!(urma_device_cap_t, max_write_size), 68);

@@ -21,11 +21,21 @@ plus example demos.
   `serve-urma`/`read-urma` + `serve-tcp`/`read-tcp`, per-size verify pass +
   warmup + timed iters, busy-poll of the CQ, never `wait_read`'s 100ms
   sleep poll; `read-urma --depth N>1` switches the URMA side to a
-  pipelined bandwidth measurement — up to N outstanding READs, both
-  transfer ends rotating their windows (landing registered at size×depth,
-  capped 1 GiB; remote cycles the peer segment), avg MiB/s + Mops, no
-  peak (per-op windows contain queueing time in a full pipeline);
-  `--duration S` runs seconds-long windows instead of `--iters` ops);
+  pipelined bandwidth measurement — up to N outstanding READs (depth is
+  bounded only by the device's jfs/jfc/jfr depth caps from `query_device`;
+  the queues are created at the requested depth, because saturating small
+  sizes needs depth×size above the fabric's bandwidth-latency product),
+  completions reaped in `poll_batch`es + `--cq-mod m` CQ moderation
+  (default auto: min(100, depth) for sizes ≤ 8 KiB, 1 above; ops are
+  posted with `user_ctx` = op index and signaled READs carry comp_order,
+  so each record proves all earlier ops done — a window ending on an
+  unsignaled tail is closed by a 1-byte fence READ, keeping op/byte
+  accounting exact at any moderation), both transfer ends rotating their
+  windows (landing registered at size×depth, `--landing-cap` ceiling
+  default 1 GiB; remote cycles the peer segment, with notes when either
+  rotation is narrower than the depth), avg MiB/s + Mops, no peak (per-op
+  windows contain queueing time in a full pipeline); `--duration S` runs
+  seconds-long windows instead of `--iters` ops);
   shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
@@ -41,17 +51,19 @@ cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
 cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
                             # targets are compiled but not run by plain
                             # `cargo test`)
-cargo test --example read_bench  # +8 (descriptor round-trip copy, size-list
+cargo test --example read_bench  # +10 (descriptor round-trip copy, size-list
                             # parse x2, serve buf sizing + buf-len suffix
                             # parse, latency percentile stats, bandwidth
-                            # stats math, slot cycling)
+                            # stats math, slot cycling, cq-mod resolution,
+                            # fence tail rule)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
 ./scripts/test_readbench.sh  # read_bench benchmark: TCP loopback always; with
                             # UB_NODES also cross-node TCP + URMA READ matrix
-                            # (DEPTH/DUR knobs pass --depth/--duration to
+                            # (DEPTH/DUR/CQMOD/LANDCAP knobs pass
+                            # --depth/--duration/--cq-mod/--landing-cap to
                             # read-urma: bandwidth mode + long windows)
 ./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
                             # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),

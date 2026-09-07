@@ -19,10 +19,16 @@
 #   SIZES / ITERS / WARMUP  benchmark knobs, passed to readers AND serves
 #                           (SIZES also sizes the serve-side buffer to its max)
 #   DEPTH                   read-urma --depth: 1 = latency table (default),
-#                           >1 = the pipelined bandwidth table instead
+#                           >1 = the pipelined bandwidth table instead (small
+#                           sizes need depth x size above the fabric BDP to
+#                           saturate - try 256..512 at 4k)
 #   DUR                     read-urma --duration seconds in bandwidth mode
 #                           (0 = the --iters pass; >=5s windows recommended
 #                           for a stable plateau at big sizes)
+#   CQMOD                   read-urma --cq-mod override (empty = auto:
+#                           min(100,depth) for sizes <=8k, 1 above)
+#   LANDCAP                 read-urma --landing-cap bytes override (empty =
+#                           the 1g default ceiling for size x depth)
 #   BUFLEN                  explicit serve-side buffer bytes (rarely needed)
 #   PORT                    TCP port (default 13860)
 #   DEV / DEV_A / DEV_B     URMA device per node (default: probe via
@@ -40,6 +46,11 @@ BENCH=()
 [ -n "${WARMUP:-}" ] && BENCH+=(--warmup "$WARMUP")
 DEPTH=${DEPTH:-1}   # read-urma only: >1 runs the bandwidth table
 DUR=${DUR:-0}       # read-urma only: --duration seconds (bandwidth mode)
+CQMOD=${CQMOD:-}    # read-urma only: --cq-mod override (empty = auto)
+LANDCAP=${LANDCAP:-} # read-urma only: --landing-cap override (empty = 1g default)
+RD=()               # read-urma-only extra flags
+[ -n "$CQMOD" ]    && RD+=(--cq-mod "$CQMOD")
+[ -n "$LANDCAP" ]  && RD+=(--landing-cap "$LANDCAP")
 PORT=${PORT:-13860}
 TMO=${TMO:-120}
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
@@ -162,7 +173,7 @@ if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
         echo "MISSING: no [desc] line from serve-urma on $A (see $LOGDIR/urma.serve.log)"
         FAIL=1
     else
-        run_node "$B" "$RDIR_B" urma.read.log read_bench read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}" --depth "$DEPTH" --duration "$DUR"
+        run_node "$B" "$RDIR_B" urma.read.log read_bench read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}" --depth "$DEPTH" --duration "$DUR" "${RD[@]}"
         grep -qF '[read-urma] done:' "$LOGDIR/urma.read.log" || { echo "MISSING: read-urma done line"; FAIL=1; }
     fi
     kill "$PS" 2>/dev/null

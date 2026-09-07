@@ -335,6 +335,11 @@ pub struct DeviceCap {
     pub max_write_size: u64,
     /// Supported page sizes as a bitmap (must include 4K, see [`PAGE_SIZE`])
     pub page_size_cap: u64,
+    /// Per-slot service classes (`priority_info`): slot i's tp-type class.
+    /// [`DeviceCap::priority_for`] resolves the jfs priority slot for a tp
+    /// type — a jetty transfers in any slot, but the fabric schedules it in
+    /// the slot's service class, so a mismatched slot can cost bandwidth.
+    pub priority_tp: [TpTypeCap; ffi::URMA_MAX_PRIORITY_CNT],
 }
 
 impl DeviceCap {
@@ -380,6 +385,11 @@ impl DeviceCap {
             max_read_size: cap.max_read_size as u64,
             max_write_size: cap.max_write_size as u64,
             page_size_cap: cap.page_size_cap,
+            priority_tp: cap.priority_info.map(|sl| TpTypeCap {
+                rtp: sl.tp_type.value & ffi::URMA_TP_TYPE_CAP_RTP != 0,
+                ctp: sl.tp_type.value & ffi::URMA_TP_TYPE_CAP_CTP != 0,
+                utp: sl.tp_type.value & ffi::URMA_TP_TYPE_CAP_UTP != 0,
+            }),
         }
     }
 
@@ -443,6 +453,20 @@ impl DeviceCap {
             }
         }
         combos
+    }
+
+    /// The lowest jfs priority slot whose service class serves this tp type —
+    /// exactly the slot urma_perftest auto-picks for `-O` when it is omitted
+    /// (and warns about). None when no slot advertises the tp type.
+    pub fn priority_for(&self, tp: TpType) -> Option<u8> {
+        self.priority_tp
+            .iter()
+            .position(|c| match tp {
+                TpType::Rtp => c.rtp,
+                TpType::Ctp => c.ctp,
+                TpType::Utp => c.utp,
+            })
+            .map(|i| i as u8)
     }
 }
 
@@ -711,6 +735,12 @@ pub struct JettyOpts {
     /// device capabilities (`max_jfs_sge` / `max_jfr_sge`, typically 13+ / 4+).
     /// 1 (default) disables scatter/gather.
     pub max_sge: u8,
+    /// Jfs priority slot, 0..=15 (`urma_jfs_cfg_t.priority`): the device maps
+    /// each slot to a service class (`DeviceCap::priority_for` resolves the
+    /// slot for a tp type). The default keeps the wrapper's original
+    /// `URMA_MAX_PRIORITY`; examples that care override it with the device's
+    /// slot for their tp type.
+    pub priority: u8,
 }
 
 impl Default for JettyOpts {
@@ -721,6 +751,7 @@ impl Default for JettyOpts {
             multi_path: false,
             token_value: TOKEN_VALUE,
             max_sge: 1,
+            priority: ffi::URMA_MAX_PRIORITY,
         }
     }
 }
@@ -758,11 +789,19 @@ impl Jetty {
             .with_order_type(0)
             .with_multi_path(opts.multi_path);
 
+        if opts.priority > ffi::URMA_MAX_PRIORITY {
+            return Err(Error::Invalid(format!(
+                "jfs priority {} is out of range 0..={}",
+                opts.priority,
+                ffi::URMA_MAX_PRIORITY
+            )));
+        }
+
         let jfs_cfg = ffi::urma_jfs_cfg_t {
             depth: opts.depth,
             flag: jfs_flag,
             trans_mode: opts.trans_mode.bit(),
-            priority: ffi::URMA_MAX_PRIORITY,
+            priority: opts.priority,
             max_sge: opts.max_sge,
             rnr_retry: ffi::URMA_TYPICAL_RNR_RETRY,
             err_timeout: ffi::URMA_TYPICAL_ERR_TIMEOUT,
@@ -1492,5 +1531,14 @@ mod tests {
             (cap.max_msg_size, cap.max_read_size, cap.max_write_size),
             (65536, 1048576, 2097152)
         );
+
+        /* priority slots: the lowest slot whose class serves the tp type
+           (perftest's auto -O resolution); unset slots serve none */
+        raw.priority_info[2].tp_type.value = ffi::URMA_TP_TYPE_CAP_RTP;
+        raw.priority_info[6].tp_type.value = ffi::URMA_TP_TYPE_CAP_CTP;
+        let cap = DeviceCap::from_raw(&raw);
+        assert_eq!(cap.priority_for(TpType::Rtp), Some(2));
+        assert_eq!(cap.priority_for(TpType::Ctp), Some(6));
+        assert_eq!(cap.priority_for(TpType::Utp), None);
     }
 }

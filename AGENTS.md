@@ -26,7 +26,7 @@ plus example demos.
   the queues are created at the requested depth, because saturating small
   sizes needs depth×size above the fabric's bandwidth-latency product),
   completions reaped in `poll_batch`es + `--cq-mod m` CQ moderation
-  (default auto: min(100, depth) for sizes ≤ 8 KiB, 1 above; ops are
+  (default auto: min(100, depth) at every size; ops are
   posted with `user_ctx` = op index and signaled READs carry comp_order,
   so each record proves all earlier ops done — a window ending on an
   unsignaled tail is closed by a 1-byte fence READ, keeping op/byte
@@ -43,7 +43,10 @@ plus example demos.
   pairs its N jettys with them one-to-one over one shared CQ; ops are
   assigned chunk-round-robin so both knobs compose, moderation/fence
   bookkeeping is per-jetty-stream); `--duration S` runs
-  seconds-long windows instead of `--iters` ops);
+  seconds-long windows instead of `--iters` ops; `--priority` pins the
+  jfs service-priority slot, defaulting to the device's slot for the
+  selected `--tp` from its `priority_info` table — what urma_perftest
+  auto-picks for `-O` when omitted);
   shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
@@ -125,7 +128,12 @@ cargo clippy --examples
 - Device capabilities are queryable up front: `urma_query_device` is bound
   in ffi.rs (cap structs + layout guards) and wrapped as
   `query_device(name) -> DeviceCap` (`supports(mode, tp)` folds in the
-  `ctp_en` gate; `Display` renders the supported-mode matrix). All
+  `ctp_en` gate; `Display` renders the supported-mode matrix;
+  `priority_for(tp)` resolves the jfs priority slot the device's
+  `priority_info` table assigns a tp type — the slot urma_perftest
+  auto-picks for `-O`; `JettyOpts::priority`, default
+  `URMA_MAX_PRIORITY`, carries it into `urma_create_jetty`, and read_bench
+  defaults it to that slot via `--priority`). All
   real-device example runs preflight their mode (CTP-RM + RM multi-path on
   bonding) via `common::check_mode_support` before creating any resource —
   `urma_cli` does the same for its selected `--mode`/`--tp` with an in-file

@@ -16,6 +16,7 @@ pub mod ffi;
 pub mod urma;
 
 pub use error::{Error, Result};
+pub use ffi::URMA_MAX_PRIORITY;
 pub use urma::{
     list_devices, query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Jetty,
     JettyId, JettyOpts, LocalSge, OrderTypeCap, PageBuf, Peer, ReadReq, RegisteredBuf,

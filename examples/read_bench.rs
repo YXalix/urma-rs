@@ -31,8 +31,11 @@
 //! completions are reaped `urma_poll_jfc`-batched (one CQ lock + software
 //! doorbell per batch, not per record), and `--cq-mod m` posts only every
 //! m-th READ with a completion record (CQ moderation; default 0 = auto:
-//! min(100, depth) for sizes ≤ 8 KiB, 1 above — per-op completion
-//! processing is exactly what caps a 4K ops-rate sweep). Signaled READs
+//! min(100, depth) at every size — per-op completion processing is exactly
+//! what caps the ops rate of a full pipeline, from a 4K sweep to a
+//! ~0.5-Mops 64 KiB one; keep depth well above the moderation, since
+//! done-counting advances in m-sized jumps and the in-flight window
+//! bottoms out near depth − m). Signaled READs
 //! carry comp_order, so each record proves every earlier op completed, and
 //! a window ending on an unsignaled tail is closed by one extra 1-byte
 //! fence READ whose record is not counted; op accounting is therefore
@@ -103,7 +106,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use urma_rs::{
     query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Error, Jetty, JettyOpts,
     Peer, ReadReq, RegisteredBuf, Result, SegDesc, TpType, TransMode, Urma, DEFAULT_DEPTH,
-    TOKEN_VALUE,
+    TOKEN_VALUE, URMA_MAX_PRIORITY,
 };
 
 /// user_ctx tag for every READ (strictly one outstanding op at a time)
@@ -129,12 +132,10 @@ const BW_LANDING_CAP: usize = 1 << 30;
 /// takes the provider's CQ lock and writes its software doorbell once, so
 /// batches amortize both (perftest's PERFTEST_POLL_BATCH is 16)
 const BW_POLL_BATCH: usize = 16;
-/// auto --cq-mod group size / the size it applies to (perftest's
-/// PERFTEST_DEF_CQ_NUM / PERFTEST_SIZE_CQ_MOD_LIMIT): above 8 KiB the
-/// completion rate is low enough that moderation would only blur the
-/// window's end, so it turns itself off
+/// auto --cq-mod group size (perftest's PERFTEST_DEF_CQ_NUM): applied at
+/// every size — per-op completion processing caps the ops rate of a full
+/// pipeline at 4K and at 64 KiB alike
 const BW_CQ_MOD_AUTO: u64 = 100;
-const BW_CQ_MOD_LIMIT: usize = 8192;
 /// jetty ceiling for bandwidth mode: the fence user_ctx space below encodes
 /// the jetty index in the last BW_MAX_JETTIES values of u64
 const BW_MAX_JETTIES: u32 = 64;
@@ -198,6 +199,13 @@ struct ModeArgs {
     /// multi-path (bonding devices force it on unless the cap probe says no)
     #[arg(long)]
     multi_path: bool,
+    /// jfs priority slot 0..=15 (perftest's -O): the device's service class
+    /// for the stream. Default: the device's slot for the selected --tp from
+    /// its priority table (what urma_perftest auto-picks when -O is omitted),
+    /// falling back to the wrapper's 15 default when the table has no such
+    /// slot.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=15))]
+    priority: Option<u8>,
 }
 
 /// benchmark knobs shared by read-urma/read-tcp
@@ -269,10 +277,11 @@ struct ReadUrmaArgs {
     post_list: u32,
     /// CQ moderation, bandwidth mode only: only every Nth READ generates a
     /// completion record (N is clamped to 1..=depth; perftest's cq_mod).
-    /// 0 = auto: min(100, depth) for sizes <= 8k - per-op completion
-    /// processing is what caps the ops rate at small sizes - and 1 above.
-    /// Window/op accounting stays exact: a signaled READ is comp-ordered, and
-    /// a tail without a record is closed by a 1-byte fence READ
+    /// 0 = auto: min(100, depth) at every size - per-op completion
+    /// processing is what caps the ops rate of a full pipeline, small or
+    /// large. Window/op accounting stays exact: a signaled READ is
+    /// comp-ordered, and a tail without a record is closed by a 1-byte
+    /// fence READ
     #[arg(long, default_value_t = 0)]
     cq_mod: u64,
     /// landing-buffer ceiling for bandwidth mode, bytes (plain or k/m/g
@@ -375,7 +384,8 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
     if a.jetties == 0 || a.jetties > BW_MAX_JETTIES {
         return Err(Error::Invalid(format!("--jetties must be 1..={BW_MAX_JETTIES}")));
     }
-    let (mode, _tp, multi_path, _) = preflight(&a.mode)?;
+    let (mode, tp, multi_path, cap) = preflight(&a.mode)?;
+    let priority = resolve_priority(&a.mode, &cap, tp);
     let buf_len = resolve_buf_len(a.buf_len, a.sizes.as_deref())?;
 
     println!("[1/5] urma init + context on {}", a.mode.dev);
@@ -385,14 +395,18 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
 
     /* one jfc shared by every jetty: the reader's multi-jetty mode reaps
        all completions from one queue (serve-urma itself never sees one) */
-    println!("[2/5] completion queue (depth {DEFAULT_DEPTH}) + {} jetty(ies)", a.jetties);
+    println!(
+        "[2/5] completion queue (depth {DEFAULT_DEPTH}) + {} jetty(ies), jfs priority {priority} \
+               for {tp}",
+        a.jetties
+    );
     let cq = CompletionQueue::new(&ctx, DEFAULT_DEPTH)?;
     let mut jetties = Vec::with_capacity(a.jetties as usize);
     for _ in 0..a.jetties {
         jetties.push(Jetty::new(
             &ctx,
             &cq,
-            JettyOpts { trans_mode: mode, multi_path, ..Default::default() },
+            JettyOpts { trans_mode: mode, multi_path, priority, ..Default::default() },
         )?);
     }
     for j in &jetties {
@@ -557,13 +571,15 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     }
 
     println!("[2/4] own completion queue (depth {qdepth}) + {} jetty(ies)", a.jetties);
+    let priority = resolve_priority(&a.mode, &cap, tp);
+    println!("      jfs priority {priority} for {tp}");
     let cq = CompletionQueue::new(&ctx, qdepth)?;
     let mut jetties = Vec::with_capacity(a.jetties as usize);
     for _ in 0..a.jetties {
         jetties.push(Jetty::new(
             &ctx,
             &cq,
-            JettyOpts { depth: qdepth, trans_mode: mode, multi_path, ..Default::default() },
+            JettyOpts { depth: qdepth, trans_mode: mode, multi_path, priority, ..Default::default() },
         )?);
     }
     for j in &jetties {
@@ -659,7 +675,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
             )?;
             print_row("urma", size, a.bench.iters, &s, a.bench.csv);
         } else {
-            let m = resolve_cq_mod(a.cq_mod, size, a.depth);
+            let m = resolve_cq_mod(a.cq_mod, a.depth);
             let bw = BwCtx {
                 jetties: &jetties,
                 cq: &cq,
@@ -871,20 +887,19 @@ fn bw_pass(
     Ok(t0.map(|t0| (t0.elapsed(), done_total)))
 }
 
-/// effective CQ moderation for one size: 0 (default) = auto — perftest's
-/// rule of min(100, depth) for sizes up to `BW_CQ_MOD_LIMIT` (per-op
-/// completion processing is what caps the ops rate at small sizes; a
-/// record per 100 ops removes that ceiling) and 1 (every op) above, where
-/// completions are sparse anyway and moderation would only blur the
-/// window's end. An explicit value overrides the rule, clamped to
-/// 1..=depth (perftest clamps cq_mod to the queue depth too).
-fn resolve_cq_mod(flag: u64, size: usize, depth: u32) -> u64 {
+/// effective CQ moderation for one pass: 0 (default) = auto — perftest's
+/// min(100, depth) at EVERY size (per-op completion processing is what caps
+/// the ops rate of a full pipeline, from a 4K sweep to a ~0.5-Mops 64 KiB
+/// one — the poster and the CQ reaper share one thread in bw_pass). An
+/// explicit value overrides the rule, clamped to 1..=depth (perftest clamps
+/// cq_mod to the queue depth too; above it a full pipeline would hold no
+/// signaled op to learn completion from). Refill granularity note:
+/// done-counting advances in cq_mod-sized jumps, so the in-flight window
+/// bottoms out near depth - cq_mod — keep depth comfortably above the
+/// moderation when chasing peak bandwidth.
+fn resolve_cq_mod(flag: u64, depth: u32) -> u64 {
     if flag == 0 {
-        if size <= BW_CQ_MOD_LIMIT {
-            BW_CQ_MOD_AUTO.min(u64::from(depth))
-        } else {
-            1
-        }
+        BW_CQ_MOD_AUTO.min(u64::from(depth))
     } else {
         flag.clamp(1, u64::from(depth))
     }
@@ -971,6 +986,26 @@ fn preflight(m: &ModeArgs) -> Result<(TransMode, TpType, bool, DeviceCap)> {
         )));
     }
     Ok((mode, tp, multi_path, cap))
+}
+
+/// jfs priority slot for the run: an explicit --priority wins, else the
+/// device's slot for the selected tp type (perftest's auto -O resolution),
+/// else the wrapper's 15 default with a note — the stream then runs in
+/// whatever service class that slot maps to
+fn resolve_priority(m: &ModeArgs, cap: &DeviceCap, tp: TpType) -> u8 {
+    if let Some(p) = m.priority {
+        return p;
+    }
+    match cap.priority_for(tp) {
+        Some(p) => p,
+        None => {
+            println!(
+                "[mode] note: the device's priority table has no {tp} slot; jfs priority stays at \
+                 the {URMA_MAX_PRIORITY} default - pass --priority to pin a slot explicitly",
+            );
+            URMA_MAX_PRIORITY
+        }
+    }
 }
 
 /* ============================== tcp: serve =============================== */
@@ -1573,17 +1608,17 @@ mod tests {
 
     #[test]
     fn bw_cq_mod_resolution() {
-        /* auto: small sizes moderate at min(100, depth), the threshold is
-           inclusive, large sizes turn moderation off */
-        assert_eq!(resolve_cq_mod(0, 4096, 64), 64);
-        assert_eq!(resolve_cq_mod(0, 4096, 512), 100);
-        assert_eq!(resolve_cq_mod(0, BW_CQ_MOD_LIMIT, 512), 100);
-        assert_eq!(resolve_cq_mod(0, BW_CQ_MOD_LIMIT + 1, 64), 1);
-        assert_eq!(resolve_cq_mod(0, 1 << 20, 512), 1);
-        /* explicit: clamped to 1..=depth, and beats the size rule */
-        assert_eq!(resolve_cq_mod(1, 4096, 64), 1);
-        assert_eq!(resolve_cq_mod(1000, 4096, 64), 64);
-        assert_eq!(resolve_cq_mod(8, 1 << 20, 64), 8);
+        /* auto: min(100, depth) at every size — moderation is no longer
+           size-gated, a full 64 KiB pipeline reaps ~0.5 Mops too */
+        assert_eq!(resolve_cq_mod(0, 1), 1);
+        assert_eq!(resolve_cq_mod(0, 64), 64);
+        assert_eq!(resolve_cq_mod(0, 100), 100);
+        assert_eq!(resolve_cq_mod(0, 512), 100);
+        /* explicit: clamped to 1..=depth (above it a full pipeline would
+           hold no signaled op to learn completion from) */
+        assert_eq!(resolve_cq_mod(1, 64), 1);
+        assert_eq!(resolve_cq_mod(1000, 64), 64);
+        assert_eq!(resolve_cq_mod(8, 64), 8);
     }
 
     #[test]

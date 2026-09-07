@@ -34,7 +34,15 @@ plus example demos.
   windows (landing registered at size×depth, `--landing-cap` ceiling
   default 1 GiB; remote cycles the peer segment, with notes when either
   rotation is narrower than the depth), avg MiB/s + Mops, no peak (per-op
-  windows contain queueing time in a full pipeline); `--duration S` runs
+  windows contain queueing time in a full pipeline); the two ops-rate
+  levers beyond moderation: `--post-list L` chains L READs into one post
+  call (`Jetty::post_read_list`, one queue-lock + doorbell per list — a
+  single-threaded poster tops out near 2 Mops) and `--jetties N` runs N
+  parallel jetty streams (serve-urma `--jetties N` exports one rjetty
+  blob per jetty — the [desc] wire format carries a blob count; reader
+  pairs its N jettys with them one-to-one over one shared CQ; ops are
+  assigned chunk-round-robin so both knobs compose, moderation/fence
+  bookkeeping is per-jetty-stream); `--duration S` runs
   seconds-long windows instead of `--iters` ops);
   shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
@@ -51,20 +59,22 @@ cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
 cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
                             # targets are compiled but not run by plain
                             # `cargo test`)
-cargo test --example read_bench  # +10 (descriptor round-trip copy, size-list
-                            # parse x2, serve buf sizing + buf-len suffix
-                            # parse, latency percentile stats, bandwidth
-                            # stats math, slot cycling, cq-mod resolution,
-                            # fence tail rule)
+cargo test --example read_bench  # +11 (descriptor round-trip incl. multi-
+                            # rjetty, size-list parse x2, serve buf sizing +
+                            # buf-len suffix parse, latency percentile stats,
+                            # bandwidth stats math, slot cycling, cq-mod
+                            # resolution, fence tail rule, jetty/rank
+                            # assignment)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
 ./scripts/test_readbench.sh  # read_bench benchmark: TCP loopback always; with
                             # UB_NODES also cross-node TCP + URMA READ matrix
-                            # (DEPTH/DUR/CQMOD/LANDCAP knobs pass
-                            # --depth/--duration/--cq-mod/--landing-cap to
-                            # read-urma: bandwidth mode + long windows)
+                            # (DEPTH/JETTYS/POSTLIST/DUR/CQMOD/LANDCAP knobs
+                            # pass --depth/--jettys/--post-list/--duration/
+                            # --cq-mod/--landing-cap: bandwidth mode + long
+                            # windows)
 ./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
                             # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),
                             # SKIPs when unset (UB has no loopback)

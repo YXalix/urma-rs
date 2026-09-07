@@ -22,6 +22,12 @@
 #                           >1 = the pipelined bandwidth table instead (small
 #                           sizes need depth x size above the fabric BDP to
 #                           saturate - try 256..512 at 4k)
+#   JETTYS                  jettys on BOTH sides: serve-urma --jetties and
+#                           read-urma --jetties (default 1). Raise after
+#                           POSTLIST stops helping, to tell a poster-CPU
+#                           ceiling from a per-jetty fabric IOPS one
+#   POSTLIST                read-urma --post-list: READs chained per post
+#                           call, one doorbell per list (empty = 1)
 #   DUR                     read-urma --duration seconds in bandwidth mode
 #                           (0 = the --iters pass; >=5s windows recommended
 #                           for a stable plateau at big sizes)
@@ -46,6 +52,8 @@ BENCH=()
 [ -n "${WARMUP:-}" ] && BENCH+=(--warmup "$WARMUP")
 DEPTH=${DEPTH:-1}   # read-urma only: >1 runs the bandwidth table
 DUR=${DUR:-0}       # read-urma only: --duration seconds (bandwidth mode)
+JETTYS=${JETTYS:-1} # both sides: jettys to create/export/import
+POSTLIST=${POSTLIST:-1} # read-urma only: READs per post call
 CQMOD=${CQMOD:-}    # read-urma only: --cq-mod override (empty = auto)
 LANDCAP=${LANDCAP:-} # read-urma only: --landing-cap override (empty = 1g default)
 RD=()               # read-urma-only extra flags
@@ -159,7 +167,7 @@ DEV_B=${DEV_B:-${DEV:-$(probe_dev "$B" "$RDIR_B")}}
 
 if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
     echo "== read_bench: urma across nodes ($B reads $A; devices $DEV_A / $DEV_B) =="
-    run_node "$A" "$RDIR_A" urma.serve.log read_bench serve-urma -d "$DEV_A" "${SRV[@]}" &
+    run_node "$A" "$RDIR_A" urma.serve.log read_bench serve-urma -d "$DEV_A" --jetties "$JETTYS" "${SRV[@]}" &
     PS=$!
     # serve-urma prints the descriptor as one hex line once its resources are
     # up; play the human: grab it from the log and pass it to nodeB's reader
@@ -173,7 +181,7 @@ if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
         echo "MISSING: no [desc] line from serve-urma on $A (see $LOGDIR/urma.serve.log)"
         FAIL=1
     else
-        run_node "$B" "$RDIR_B" urma.read.log read_bench read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}" --depth "$DEPTH" --duration "$DUR" "${RD[@]}"
+        run_node "$B" "$RDIR_B" urma.read.log read_bench read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}" --depth "$DEPTH" --jetties "$JETTYS" --post-list "$POSTLIST" --duration "$DUR" "${RD[@]}"
         grep -qF '[read-urma] done:' "$LOGDIR/urma.read.log" || { echo "MISSING: read-urma done line"; FAIL=1; }
     fi
     kill "$PS" 2>/dev/null

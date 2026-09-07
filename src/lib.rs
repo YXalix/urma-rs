@@ -18,7 +18,7 @@ pub mod urma;
 pub use error::{Error, Result};
 pub use urma::{
     list_devices, query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Jetty,
-    JettyId, JettyOpts, LocalSge, OrderTypeCap, PageBuf, Peer, RegisteredBuf, RegisteredSeg,
-    SegDesc, TpType, TpTypeCap, TransMode, Urma, DEFAULT_DEPTH, PAGE_SIZE, POLL_INTERVAL,
-    POLL_RETRIES, TOKEN_VALUE,
+    JettyId, JettyOpts, LocalSge, OrderTypeCap, PageBuf, Peer, ReadReq, RegisteredBuf,
+    RegisteredSeg, SegDesc, TpType, TpTypeCap, TransMode, Urma, DEFAULT_DEPTH, PAGE_SIZE,
+    POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE,
 };

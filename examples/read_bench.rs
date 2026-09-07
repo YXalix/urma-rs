@@ -37,6 +37,16 @@
 //! a window ending on an unsignaled tail is closed by one extra 1-byte
 //! fence READ whose record is not counted; op accounting is therefore
 //! exact at any moderation.
+//! Past the completion path, two more perftest levers attack the two
+//! remaining rate limiters: `--post-list L` chains L READs into ONE post
+//! call (`urma_jfs_wr_t.next`, one queue-lock + doorbell per list) — a
+//! single-threaded poster otherwise tops out near 2 Mops — and
+//! `--jetties N` spreads the sweep over N parallel jettys (serve-urma
+//! `--jetties N` exports one rjetty blob per jetty; each local jetty
+//! pairs with one, all completions land on the shared CQ), the probe for
+//! a per-jetty fabric IOPS ceiling. Ops are assigned chunk-round-robin so
+//! both knobs compose, and moderation/fence bookkeeping runs per jetty
+//! stream, keeping the accounting exact at any combination.
 //! Both transfer ends rotate through their windows per op — the landing
 //! buffer is registered at size×depth (`--landing-cap` ceiling, default
 //! 1 GiB, with an overlap note when it bites), and the remote side cycles
@@ -66,10 +76,14 @@
 //!         --sizes 8..16m   # serve sizes its buffer to the sweep's maximum
 //!
 //! # URMA READ bandwidth: same sweep, pipelined depth (perftest read_bw style).
-//! # Small sizes need a deep pipeline + CQ moderation to reach line rate:
-//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m --buf-len 512m
+//! # Small sizes need a deep pipeline + CQ moderation to reach line rate; if
+//! # 4K still plateaus around 2 Mops, chain posts (--post-list) and only then
+//! # add parallel jettys (--jetties on BOTH sides) to tell a poster-CPU
+//! # ceiling from a per-jetty fabric IOPS one:
+//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m \
+//!         --buf-len 512m --jetties 4
 //! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
-//!         --sizes 4k..1m --depth 512 --duration 10
+//!         --sizes 4k..1m --depth 512 --post-list 32 --jetties 4 --duration 10
 //!
 //! # TCP reference over the same pair of machines:
 //! nodeA$ cargo run --example read_bench -- serve-tcp
@@ -88,7 +102,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use urma_rs::{
     query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Error, Jetty, JettyOpts,
-    Peer, RegisteredBuf, Result, SegDesc, TpType, TransMode, Urma, DEFAULT_DEPTH, TOKEN_VALUE,
+    Peer, ReadReq, RegisteredBuf, Result, SegDesc, TpType, TransMode, Urma, DEFAULT_DEPTH,
+    TOKEN_VALUE,
 };
 
 /// user_ctx tag for every READ (strictly one outstanding op at a time)
@@ -120,9 +135,16 @@ const BW_POLL_BATCH: usize = 16;
 /// window's end, so it turns itself off
 const BW_CQ_MOD_AUTO: u64 = 100;
 const BW_CQ_MOD_LIMIT: usize = 8192;
-/// user_ctx of the bandwidth fence READ (never a real op index: those are
-/// 0..posts); its completion record covers an unsignaled tail
-const BW_FENCE_CTX: u64 = u64::MAX;
+/// jetty ceiling for bandwidth mode: the fence user_ctx space below encodes
+/// the jetty index in the last BW_MAX_JETTIES values of u64
+const BW_MAX_JETTIES: u32 = 64;
+/// user_ctx base of the bandwidth fence READs: jetty j's fence posts with
+/// `BW_FENCE_CTX_BASE - j` (never a real op index — those are counts, tiny);
+/// each jetty's fence record closes that jetty's unsignaled tail
+const BW_FENCE_CTX_BASE: u64 = u64::MAX;
+/// lowest fence user_ctx (that of jetty BW_MAX_JETTIES-1): any ctx at or
+/// above it decodes as a fence, anything below as an op index
+const BW_FENCE_CTX_MIN: u64 = BW_FENCE_CTX_BASE - (BW_MAX_JETTIES - 1) as u64;
 
 #[derive(Parser)]
 #[command(
@@ -138,9 +160,10 @@ const BW_FENCE_CTX: u64 = u64::MAX;
                   and the warmup. read-urma --depth>1 switches the URMA side to a pipelined \
                   bandwidth measurement (urma_perftest read_bw's measurement: both transfer \
                   ends rotating their windows, batched completion reaping, --cq-mod completion \
-                  moderation for small sizes, depth bounded by the device's queue caps; \
-                  --duration for stable long windows). scripts/test_readbench.sh runs the \
-                  full matrix."
+                  moderation for small sizes, depth bounded by the device's queue caps, \
+                  --post-list chained posts and --jetties parallel streams for the ops-rate \
+                  ceiling; --duration for stable long windows). scripts/test_readbench.sh \
+                  runs the full matrix."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -201,6 +224,10 @@ struct BenchArgs {
 struct ServeUrmaArgs {
     #[command(flatten)]
     mode: ModeArgs,
+    /// jettys to create and export (one rjetty blob each): pair with the
+    /// reader's --jetties; extra jettys cost nothing until imported
+    #[arg(long, default_value_t = 1)]
+    jetties: u32,
     /// size sweep the reader will run; the segment is sized to its maximum
     #[arg(long)]
     sizes: Option<String>,
@@ -226,6 +253,20 @@ struct ReadUrmaArgs {
     /// i.e. hundreds at 4K on fast fabrics)
     #[arg(long, default_value_t = 1)]
     depth: u32,
+    /// parallel jettys in bandwidth mode (serve-urma must have exported at
+    /// least this many rjetty blobs via its own --jetties): the sweep's READs
+    /// are assigned round-robin, each local jetty paired with one imported
+    /// remote jetty, all completions on one shared CQ. A per-jetty fabric
+    /// IOPS ceiling is the other candidate for what caps small-size Mops —
+    /// if --post-list alone does not lift 4K, this is the knob
+    #[arg(long, default_value_t = 1)]
+    jetties: u32,
+    /// READs per doorbell in bandwidth mode (perftest's post_list): this many
+    /// work requests are chained into ONE post call, amortizing the per-post
+    /// queue lock + doorbell that otherwise caps a single-threaded poster at
+    /// ~2 Mops. Clamped to 1..=depth; try 8..64 at small sizes
+    #[arg(long, default_value_t = 1)]
+    post_list: u32,
     /// CQ moderation, bandwidth mode only: only every Nth READ generates a
     /// completion record (N is clamped to 1..=depth; perftest's cq_mod).
     /// 0 = auto: min(100, depth) for sizes <= 8k - per-op completion
@@ -331,6 +372,9 @@ fn main() -> ExitCode {
 /* ============================== urma: serve ============================== */
 
 fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
+    if a.jetties == 0 || a.jetties > BW_MAX_JETTIES {
+        return Err(Error::Invalid(format!("--jetties must be 1..={BW_MAX_JETTIES}")));
+    }
     let (mode, _tp, multi_path, _) = preflight(&a.mode)?;
     let buf_len = resolve_buf_len(a.buf_len, a.sizes.as_deref())?;
 
@@ -339,11 +383,21 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
     let ctx = Context::create(&urma, &a.mode.dev)?;
     println!("      context eid {}", ctx.eid());
 
-    println!("[2/5] completion queue (depth {DEFAULT_DEPTH}) + jetty");
+    /* one jfc shared by every jetty: the reader's multi-jetty mode reaps
+       all completions from one queue (serve-urma itself never sees one) */
+    println!("[2/5] completion queue (depth {DEFAULT_DEPTH}) + {} jetty(ies)", a.jetties);
     let cq = CompletionQueue::new(&ctx, DEFAULT_DEPTH)?;
-    let jetty =
-        Jetty::new(&ctx, &cq, JettyOpts { trans_mode: mode, multi_path, ..Default::default() })?;
-    println!("      jetty id {} uasid {:#x}", jetty.id().id, jetty.id().uasid);
+    let mut jetties = Vec::with_capacity(a.jetties as usize);
+    for _ in 0..a.jetties {
+        jetties.push(Jetty::new(
+            &ctx,
+            &cq,
+            JettyOpts { trans_mode: mode, multi_path, ..Default::default() },
+        )?);
+    }
+    for j in &jetties {
+        println!("      jetty id {} uasid {:#x}", j.id().id, j.id().uasid);
+    }
 
     println!("[3/5] register {buf_len}-byte segment, fill read pattern");
     let mut buf = RegisteredBuf::new(&ctx, buf_len, TOKEN_VALUE)?;
@@ -356,8 +410,16 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
 
     println!("[4/5] export seg-ctx / rjetty blobs (blob import path, no kernel exchange)");
     let seg_ctx = buf.export_seg_ctx()?;
-    let rjetty = jetty.export_rjetty()?;
-    println!("      seg-ctx {} bytes, rjetty {} bytes", seg_ctx.len(), rjetty.len());
+    let mut rjetty = Vec::with_capacity(jetties.len());
+    for j in &jetties {
+        rjetty.push(j.export_rjetty()?);
+    }
+    println!(
+        "      seg-ctx {} bytes, {} x rjetty {} bytes",
+        seg_ctx.len(),
+        rjetty.len(),
+        rjetty.first().map(|b| b.len()).unwrap_or(0)
+    );
 
     println!("[5/5] descriptor for the peer (one hex line):");
     println!("[desc] {}", pack_desc(&WireDesc { seg, seg_ctx, rjetty }));
@@ -399,6 +461,23 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
                 .into(),
         ));
     }
+    if (a.jetties > 1 || a.post_list > 1) && a.depth == 1 {
+        return Err(Error::Invalid(
+            "--jetties/--post-list need bandwidth mode: pass --depth > 1 (latency mode is one \
+             serialized op at a time)"
+                .into(),
+        ));
+    }
+    if a.jetties == 0 || a.jetties > BW_MAX_JETTIES {
+        return Err(Error::Invalid(format!("--jetties must be 1..={BW_MAX_JETTIES}")));
+    }
+    if a.post_list == 0 || a.post_list > a.depth {
+        return Err(Error::Invalid(format!(
+            "--post-list must be 1..=depth ({}): a chained work-request list longer than the \
+             pipeline would overflow the send queue",
+            a.depth
+        )));
+    }
     let duration = (a.duration > 0).then_some(a.duration);
 
     println!("[read-urma] unpack peer descriptor");
@@ -434,7 +513,10 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
             a.depth, cap.max_jfs_depth, cap.max_jfc_depth, cap.max_jfr_depth
         )));
     }
-    let qdepth = a.depth.max(DEFAULT_DEPTH);
+    /* + jetties of headroom over the in-flight budget: the per-jetty fence
+       READs at a drain sit on top of a full pipeline without overflowing
+       any single queue */
+    let qdepth = a.depth.max(DEFAULT_DEPTH) + a.jetties;
     /* sizes above the READ ceiling are skipped with a note, not fatal: one
        sweep then works on any device. A one-sided READ is bounded by the
        device's max_read_size — max_msg_size caps two-sided messages, not
@@ -474,17 +556,41 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
         ));
     }
 
-    println!("[2/4] own completion queue + jetty at depth {qdepth} (the READ is posted from our jetty)");
+    println!("[2/4] own completion queue (depth {qdepth}) + {} jetty(ies)", a.jetties);
     let cq = CompletionQueue::new(&ctx, qdepth)?;
-    let jetty = Jetty::new(
-        &ctx,
-        &cq,
-        JettyOpts { depth: qdepth, trans_mode: mode, multi_path, ..Default::default() },
-    )?;
-    println!("      jetty id {} uasid {:#x}", jetty.id().id, jetty.id().uasid);
+    let mut jetties = Vec::with_capacity(a.jetties as usize);
+    for _ in 0..a.jetties {
+        jetties.push(Jetty::new(
+            &ctx,
+            &cq,
+            JettyOpts { depth: qdepth, trans_mode: mode, multi_path, ..Default::default() },
+        )?);
+    }
+    for j in &jetties {
+        println!("      jetty id {} uasid {:#x}", j.id().id, j.id().uasid);
+    }
 
-    println!("[3/4] import peer via blobs ({tp})");
-    let peer = Peer::import_ctx(&ctx, &wire.seg_ctx, &wire.rjetty, tp, TOKEN_VALUE)?;
+    println!("[3/4] import {} peer(s) via blobs ({tp})", a.jetties);
+    let want = a.jetties as usize;
+    if wire.rjetty.len() < want {
+        return Err(Error::Invalid(format!(
+            "--jetties {want} but the descriptor carries {} rjetty blob(s): restart serve-urma \
+             with --jetties {want} (it exports one blob per jetty)",
+            wire.rjetty.len()
+        )));
+    }
+    if wire.rjetty.len() > want {
+        println!(
+            "[read-urma] note: descriptor carries {} rjetty blobs, using the first {want}",
+            wire.rjetty.len()
+        );
+    }
+    let mut peers = Vec::with_capacity(want);
+    for rj in &wire.rjetty[..want] {
+        peers.push(Peer::import_ctx(&ctx, &wire.seg_ctx, rj, tp, TOKEN_VALUE)?);
+    }
+    /* latency/verify paths always run on jetty 0 */
+    let (jetty, peer) = (&jetties[0], &peers[0]);
 
     let max_size = *sizes.last().unwrap();
     /* bandwidth mode registers size x depth of landing (capped) so the
@@ -513,8 +619,11 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
             );
         }
         println!(
-            "[read-urma] bandwidth mode: depth {}, landing {capped} bytes, remote rotation within the {}-byte peer segment",
+            "[read-urma] bandwidth mode: depth {}, {} jetty(ies), post-list {}, cq-mod {}, landing {capped} bytes, remote rotation within the {}-byte peer segment",
             a.depth,
+            a.jetties,
+            a.post_list,
+            if a.cq_mod == 0 { "auto".to_string() } else { a.cq_mod.to_string() },
             wire.seg.len
         );
         capped
@@ -529,19 +638,20 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     let landing = RegisteredBuf::new(&ctx, landing_len, TOKEN_VALUE)?;
     let remote_va = wire.seg.va;
 
-    print_header("urma", a.bench.iters, a.bench.warmup, a.depth, a.duration, a.bench.csv);
+    let bwlabel = BwLabel { depth: a.depth, jetties: a.jetties, post_list: a.post_list };
+    print_header("urma", a.bench.iters, a.bench.warmup, &bwlabel, a.duration, a.bench.csv);
     for &size in &sizes {
         let sge = landing.sge(0, size as u32)?;
         /* verify pass outside the timed loop: one serialized READ, compare the
            pattern — kept at depth 1 even in bandwidth mode (a correctness pass
            must not overlap in-flight READs) */
-        jetty.post_read(&peer, remote_va, &[sge], READ_CTX)?;
+        jetty.post_read(peer, remote_va, &[sge], READ_CTX)?;
         let _ = wait_read_spin(&cq)?;
         check_pat(&format!("size {size} verify read"), &landing[..size])?;
         if a.depth == 1 {
             let s = run_iters(
                 || {
-                    jetty.post_read(&peer, remote_va, &[sge], READ_CTX)?;
+                    jetty.post_read(peer, remote_va, &[sge], READ_CTX)?;
                     wait_read_spin(&cq).map(|_| ())
                 },
                 a.bench.warmup,
@@ -551,16 +661,17 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
         } else {
             let m = resolve_cq_mod(a.cq_mod, size, a.depth);
             let bw = BwCtx {
-                jetty: &jetty,
+                jetties: &jetties,
                 cq: &cq,
-                peer: &peer,
+                peers: &peers,
                 remote_va,
                 seg_len: wire.seg.len,
                 landing: &landing,
+                post_list: a.post_list,
             };
             let s =
                 run_bw_iters(&bw, size, a.depth, m, a.bench.warmup, a.bench.iters, duration)?;
-            print_bw_row("urma", size, a.depth, m, &s, a.bench.csv);
+            print_bw_row("urma", size, &bwlabel, m, &s, a.bench.csv);
         }
     }
     let per = if a.depth > 1 && a.duration > 0 {
@@ -593,15 +704,34 @@ fn wait_read_spin(cq: &CompletionQueue) -> Result<Completion> {
 
 /* =========================== urma: read (bandwidth) ====================== */
 
-/// the fixed post parameters shared by the pipelined bandwidth passes
+/// the fixed parameters shared by the pipelined bandwidth passes
 struct BwCtx<'a> {
-    jetty: &'a Jetty,
+    /// one per --jetties, all sharing the one CQ; op i runs on
+    /// `bw_op_jetty(i)` paired with `peers[jetty]`
+    jetties: &'a [Jetty],
     cq: &'a CompletionQueue,
-    peer: &'a Peer,
+    peers: &'a [Peer],
     remote_va: u64,
     /// peer segment length: the remote rotation window
     seg_len: u64,
     landing: &'a RegisteredBuf,
+    /// READs chained per post call (--post-list)
+    post_list: u32,
+}
+
+/// jetty of global op `i`: chunks of `list` consecutive ops per jetty,
+/// cycling through `n` jettys (list=1 is plain round-robin). Chunking keeps
+/// post-list batching and jetty parallelism composable: one chunk is one
+/// linked work-request list on one jetty.
+fn bw_op_jetty(i: u64, n: u64, list: u64) -> usize {
+    ((i / list) % n) as usize
+}
+
+/// rank of global op `i` within its own jetty's op stream — what CQ
+/// moderation counts against, since completions order per jetty. With n=1
+/// (or list|n collapsing to a single stream) it is `i` itself.
+fn bw_op_rank(i: u64, n: u64, list: u64) -> u64 {
+    (i / (list * n)) * list + i % list
 }
 
 /// landing offset for op `i` of the bandwidth loop: the `len/size` disjoint
@@ -633,89 +763,112 @@ impl BwStop {
     }
 }
 
-/// one pipelined pass: post while the pipeline is not full and the stop
+/// one pipelined pass over `bw.jetties` streams: post chunks while the
+/// pipeline (global in-flight budget `depth`) is not full and the stop
 /// condition allows, reap completions in `BW_POLL_BATCH` batches as they
-/// land (each one frees slots for the next posts). Ops are posted with
-/// `user_ctx = op index`; with CQ moderation `cq_mod = m` only every m-th
-/// op is signaled, and a signaled READ carries comp_order, so a completion
-/// record advances the done count to `user_ctx + 1` — proof, not
-/// assumption. A pass that stops on an unsignaled tail posts one extra
-/// 1-byte signaled fence READ (`BW_FENCE_CTX`) whose record closes the
-/// window; the fence byte is not counted, so op/byte accounting is exact at
-/// any moderation. A timed pass returns its whole
-/// first-post→last-completion window plus the completed-op count.
-/// Completions only need counting — no per-op timestamps: in a full
-/// pipeline every post→completion window contains queueing time, so per-op
-/// figures are pipeline noise, not fabric properties. The hang guard resets
-/// on every completion: it bounds silence, not the pass (a duration pass
-/// runs long by design).
+/// land (each one frees slots for the next chunks). Ops carry
+/// `user_ctx = global op index`; with CQ moderation `cq_mod = m` only ops
+/// whose per-jetty rank is ≡ m-1 (mod m) are signaled, and a signaled READ
+/// carries comp_order, so a record proves every earlier op on THAT jetty
+/// completed — `done[j]` tracks it per jetty. A jetty whose stream stops on
+/// an unsignaled tail gets one extra 1-byte signaled fence READ
+/// (`BW_FENCE_CTX_BASE - j`) whose record closes it; fence bytes are not
+/// counted, so op/byte accounting is exact at any moderation and jetty
+/// count. A timed pass returns its whole first-post→last-completion window
+/// plus the completed-op count. Completions only need counting — no per-op
+/// timestamps: in a full pipeline every post→completion window contains
+/// queueing time, so per-op figures are pipeline noise, not fabric
+/// properties. The hang guard resets on every completion: it bounds
+/// silence, not the pass (a duration pass runs long by design).
 fn bw_pass(
     bw: &BwCtx, size: usize, depth: u32, cq_mod: u64, stop: &BwStop, timed: bool,
 ) -> Result<Option<(Duration, u64)>> {
-    let (mut next, mut done) = (0u64, 0u64);
-    let mut fenced = false;
+    let n = bw.jetties.len() as u64;
+    let list = u64::from(bw.post_list);
+    let mut next = 0u64;
+    let mut posted = vec![0u64; n as usize];
+    let mut done = vec![0u64; n as usize];
+    let mut done_total = 0u64;
+    let mut fenced = vec![false; n as usize];
     let mut t0 = None;
     let mut deadline = Instant::now() + READ_TIMEOUT;
     let mut crs = [Completion { status: 0, user_ctx: 0, completion_len: 0 }; BW_POLL_BATCH];
     loop {
-        while !stop.stop_posting(next) && next - done < u64::from(depth) {
-            let off = bw_slot_off(next, size, bw.landing.len());
-            let va = bw.remote_va + bw_slot_off(next, size, bw.seg_len as usize) as u64;
-            let signaled = (next + 1) % cq_mod == 0;
-            bw.jetty.post_read_signaled(
-                bw.peer,
-                va,
-                &[bw.landing.sge(off, size as u32)?],
-                next,
-                signaled,
-            )?;
-            if timed && next == 0 {
-                t0 = Some(Instant::now());
+        while !stop.stop_posting(next) && next - done_total < u64::from(depth) {
+            /* one chunk = the rest of the current post-list window, all on
+               one jetty: a truncated previous chunk continues, not starts */
+            let j = bw_op_jetty(next, n, list);
+            let rem = (list - next % list) as usize;
+            let mut reqs = Vec::with_capacity(rem);
+            while reqs.len() < rem
+                && !stop.stop_posting(next)
+                && next - done_total < u64::from(depth)
+            {
+                let rank = bw_op_rank(next, n, list);
+                let off = bw_slot_off(next, size, bw.landing.len());
+                let va = bw.remote_va + bw_slot_off(next, size, bw.seg_len as usize) as u64;
+                reqs.push(ReadReq {
+                    remote_va: va,
+                    local: bw.landing.sge(off, size as u32)?,
+                    user_ctx: next,
+                    signaled: (rank + 1).is_multiple_of(cq_mod),
+                });
+                if timed && next == 0 {
+                    t0 = Some(Instant::now());
+                }
+                next += 1;
+                posted[j] += 1;
             }
-            next += 1;
+            bw.jetties[j].post_read_list(&bw.peers[j], &reqs)?;
         }
-        /* posting has stopped on an unsignaled tail: once a queue slot frees
-           up, fence the pipeline so the window can still end on a record
-           that proves every posted op completed */
-        if !fenced
-            && next > 0
-            && bw_tail_uncovered(next, cq_mod)
-            && stop.stop_posting(next)
-            && next - done < u64::from(depth)
-        {
-            bw.jetty.post_read_signaled(
-                bw.peer,
-                bw.remote_va,
-                &[bw.landing.sge(0, 1)?],
-                BW_FENCE_CTX,
-                true,
-            )?;
-            fenced = true;
+        /* posting has stopped: once a queue slot frees up, fence every
+           jetty that ended on an unsignaled tail, so the window can still
+           close on records that prove all posted ops completed */
+        if stop.stop_posting(next) && next - done_total < u64::from(depth) {
+            for j in 0..n as usize {
+                if !fenced[j] && bw_tail_uncovered(posted[j], cq_mod) {
+                    bw.jetties[j].post_read_signaled(
+                        &bw.peers[j],
+                        bw.remote_va,
+                        &[bw.landing.sge(0, 1)?],
+                        BW_FENCE_CTX_BASE - j as u64,
+                        true,
+                    )?;
+                    fenced[j] = true;
+                }
+            }
         }
-        if done == next && stop.stop_posting(next) {
+        if done_total == next && stop.stop_posting(next) {
             break;
         }
-        let n = bw.cq.poll_batch(&mut crs)?;
-        if n == 0 {
+        let cnt = bw.cq.poll_batch(&mut crs)?;
+        if cnt == 0 {
             if Instant::now() >= deadline {
                 return Err(Error::PollTimeout { user_ctx: next });
             }
             std::hint::spin_loop();
             continue;
         }
-        for cr in &crs[..n] {
+        for cr in &crs[..cnt] {
             if !cr.is_success() {
                 return Err(Error::BadCompletion { status: cr.status, user_ctx: cr.user_ctx });
             }
-            done = if cr.user_ctx == BW_FENCE_CTX {
-                next /* the fence record covers every posted op */
+            let ctx = cr.user_ctx;
+            let (j, target) = if ctx >= BW_FENCE_CTX_MIN {
+                let j = (BW_FENCE_CTX_BASE - ctx) as usize;
+                (j, posted[j])
             } else {
-                done.max(cr.user_ctx + 1)
+                let j = bw_op_jetty(ctx, n, list);
+                (j, bw_op_rank(ctx, n, list) + 1)
             };
+            if target > done[j] {
+                done_total += target - done[j];
+                done[j] = target;
+            }
             deadline = Instant::now() + READ_TIMEOUT;
         }
     }
-    Ok(t0.map(|t0| (t0.elapsed(), done)))
+    Ok(t0.map(|t0| (t0.elapsed(), done_total)))
 }
 
 /// effective CQ moderation for one size: 0 (default) = auto — perftest's
@@ -737,9 +890,9 @@ fn resolve_cq_mod(flag: u64, size: usize, depth: u32) -> u64 {
     }
 }
 
-/// whether the first `posts` ops end on an unsignaled one — the tail a
-/// fence READ must cover: moderation on, and the posts not a whole number
-/// of groups
+/// whether a jetty stream of `posts` ops ends on an unsignaled one — the
+/// tail a fence READ must cover: moderation on, and the stream not a whole
+/// number of groups
 fn bw_tail_uncovered(posts: u64, cq_mod: u64) -> bool {
     cq_mod > 1 && !posts.is_multiple_of(cq_mod)
 }
@@ -873,7 +1026,14 @@ fn read_tcp_run(a: &ReadTcpArgs) -> Result<()> {
 
     let max_size = *sizes.last().unwrap();
     let mut rbuf = vec![0u8; max_size];
-    print_header("tcp", a.bench.iters, a.bench.warmup, 1, 0, a.bench.csv);
+    print_header(
+        "tcp",
+        a.bench.iters,
+        a.bench.warmup,
+        &BwLabel { depth: 1, jetties: 1, post_list: 1 },
+        0,
+        a.bench.csv,
+    );
     for &size in &sizes {
         let req = (size as u32).to_le_bytes();
         /* verify pass outside the timed loop, same policy as the URMA side */
@@ -1067,20 +1227,38 @@ fn bw_stats(size: usize, ops: u64, total: Duration) -> BwStats {
     }
 }
 
-fn print_header(transport: &str, iters: u32, warmup: u32, depth: u32, duration: u64, csv: bool) {
+/// the bandwidth knobs the printers need, bundled to keep their signatures
+/// small (latency mode passes all-1s)
+struct BwLabel {
+    depth: u32,
+    jetties: u32,
+    post_list: u32,
+}
+
+fn print_header(
+    transport: &str, iters: u32, warmup: u32, bw: &BwLabel, duration: u64, csv: bool,
+) {
     if csv {
-        if depth > 1 {
-            println!("csv,transport,size_bytes,ops,depth,cq_mod,bw_avg_mib,mops");
+        if bw.depth > 1 {
+            println!("csv,transport,size_bytes,ops,depth,cq_mod,bw_avg_mib,mops,jetties,post_list");
         } else {
             println!("csv,transport,size_bytes,iters,min_us,p50_us,avg_us,p99_us,max_us");
         }
-    } else if depth > 1 {
+    } else if bw.depth > 1 {
         let mode = if duration > 0 {
             format!("{duration}s window + 1s warmup")
         } else {
             format!("{iters} iters + {warmup} warmup")
         };
-        println!("== {transport} READ bandwidth: depth {depth}, {mode} per size, MiB/s ==");
+        let parallel = if bw.jetties > 1 || bw.post_list > 1 {
+            format!(", {} jetty(ies), post-list {}", bw.jetties, bw.post_list)
+        } else {
+            String::new()
+        };
+        println!(
+            "== {transport} READ bandwidth: depth {}{parallel}, {mode} per size, MiB/s ==",
+            bw.depth
+        );
         println!("{:>10} {:>7} {:>10} {:>10}", "size", "cq-mod", "avg", "Mops");
     } else {
         println!("== {transport} READ latency: {iters} iters + {warmup} warmup per size, µs ==");
@@ -1099,9 +1277,14 @@ fn print_row(transport: &str, size: usize, iters: u32, s: &Stats, csv: bool) {
     }
 }
 
-fn print_bw_row(transport: &str, size: usize, depth: u32, cq_mod: u64, s: &BwStats, csv: bool) {
+fn print_bw_row(
+    transport: &str, size: usize, bw: &BwLabel, cq_mod: u64, s: &BwStats, csv: bool,
+) {
     if csv {
-        println!("csv,{transport},{size},{},{depth},{cq_mod},{:.2},{:.3}", s.ops, s.avg, s.mops);
+        println!(
+            "csv,{transport},{size},{},{},{cq_mod},{:.2},{:.3},{},{}",
+            s.ops, bw.depth, s.avg, s.mops, bw.jetties, bw.post_list
+        );
     } else {
         println!("{:>10} {:>7} {:>10.2} {:>10.3}", size, cq_mod, s.avg, s.mops);
     }
@@ -1137,17 +1320,21 @@ fn check_pat(what: &str, buf: &[u8]) -> Result<()> {
    too, so common/mod.rs — with its serde/tokio — is deliberately not used) */
 
 /// Everything read-urma needs on the other node: the plain [`SegDesc`] (the
-/// length ceiling, the eid for the loopback guard) plus the two import blobs.
+/// length ceiling, the eid for the loopback guard), the seg-ctx import blob
+/// and one rjetty blob per serve-side jetty (serve-urma --jetties N exports
+/// N; the reader pairs its own N jettys with them one-to-one).
 struct WireDesc {
     seg: SegDesc,
     seg_ctx: Vec<u8>,
-    rjetty: Vec<u8>,
+    rjetty: Vec<Vec<u8>>,
 }
 
-/// little-endian: eid[16] uasid va len attr token_id seg_len rjetty_len blobs
+/// little-endian: eid[16] uasid va len attr token_id
+/// seg_ctx_len u32 rjetty_cnt u32 rjetty_len[cnt] u32 seg_ctx blobs...
 fn pack_desc(d: &WireDesc) -> String {
     let seg = &d.seg;
-    let mut b = Vec::with_capacity(52 + d.seg_ctx.len() + d.rjetty.len());
+    let rj_total: usize = d.rjetty.iter().map(|b| b.len()).sum();
+    let mut b = Vec::with_capacity(52 + 4 * d.rjetty.len() + d.seg_ctx.len() + rj_total);
     b.extend_from_slice(&seg.eid.0);
     b.extend_from_slice(&seg.uasid.to_le_bytes());
     b.extend_from_slice(&seg.va.to_le_bytes());
@@ -1156,8 +1343,13 @@ fn pack_desc(d: &WireDesc) -> String {
     b.extend_from_slice(&seg.token_id.to_le_bytes());
     b.extend_from_slice(&(d.seg_ctx.len() as u32).to_le_bytes());
     b.extend_from_slice(&(d.rjetty.len() as u32).to_le_bytes());
+    for rj in &d.rjetty {
+        b.extend_from_slice(&(rj.len() as u32).to_le_bytes());
+    }
     b.extend_from_slice(&d.seg_ctx);
-    b.extend_from_slice(&d.rjetty);
+    for rj in &d.rjetty {
+        b.extend_from_slice(rj);
+    }
     hex_enc(&b)
 }
 
@@ -1175,9 +1367,18 @@ fn unpack_desc(s: &str) -> Result<WireDesc> {
         token_id: rd.u32("token_id")?,
     };
     let seg_len = rd.u32("seg ctx length")? as usize;
-    let rj_len = rd.u32("rjetty length")? as usize;
+    let rj_cnt = rd.u32("rjetty count")? as usize;
+    if rj_cnt == 0 {
+        return Err(Error::Invalid("descriptor carries no rjetty blob".into()));
+    }
+    let rj_lens = (0..rj_cnt)
+        .map(|i| Ok(rd.u32(&format!("rjetty length #{i}"))? as usize))
+        .collect::<std::result::Result<Vec<_>, Error>>()?;
     let seg_ctx = rd.take(seg_len, "seg ctx")?.to_vec();
-    let rjetty = rd.take(rj_len, "rjetty")?.to_vec();
+    let mut rjetty = Vec::with_capacity(rj_cnt);
+    for (i, &len) in rj_lens.iter().enumerate() {
+        rjetty.push(rd.take(len, &format!("rjetty #{i}"))?.to_vec());
+    }
     if !rd.b.is_empty() {
         return Err(Error::Invalid(format!("{} trailing bytes in descriptor", rd.b.len())));
     }
@@ -1256,7 +1457,7 @@ mod tests {
                 token_id: 7,
             },
             seg_ctx: vec![0xaa; 48],
-            rjetty: vec![0xbb; 55],
+            rjetty: vec![vec![0xbb; 55]],
         };
         let hex = pack_desc(&d);
         let rt = unpack_desc(&hex).expect("roundtrip");
@@ -1269,6 +1470,17 @@ mod tests {
         assert!(unpack_desc(&format!("{hex}00")).is_err()); /* trailing bytes */
         assert_eq!(rt.seg_ctx, d.seg_ctx);
         assert_eq!(rt.rjetty, d.rjetty);
+
+        /* multi-jetty descriptor: N rjetty blobs survive the round trip and
+           keep their order (jetty i pairs with blob i) */
+        let d = WireDesc {
+            seg: d.seg,
+            seg_ctx: vec![0xaa; 8],
+            rjetty: vec![vec![1; 3], vec![2; 5], vec![3; 7]],
+        };
+        let rt = unpack_desc(&pack_desc(&d)).expect("roundtrip");
+        assert_eq!(rt.rjetty, d.rjetty);
+        assert_eq!(rt.seg_ctx, d.seg_ctx);
     }
 
     #[test]
@@ -1381,5 +1593,37 @@ mod tests {
         assert!(bw_tail_uncovered(1050, 100)); /* 50-op tail left unsignaled */
         assert!(bw_tail_uncovered(1, 100)); /* a single op with moderation on */
         assert!(!bw_tail_uncovered(0, 100)); /* nothing posted: nothing to cover */
+    }
+
+    #[test]
+    fn bw_op_assignment() {
+        /* single jetty: identity mapping whatever the post-list */
+        for i in 0..50u64 {
+            assert_eq!(bw_op_jetty(i, 1, 1), 0);
+            assert_eq!(bw_op_jetty(i, 1, 8), 0);
+            assert_eq!(bw_op_rank(i, 1, 1), i);
+            assert_eq!(bw_op_rank(i, 1, 8), i);
+        }
+        /* round-robin (list=1): op i on jetty i%n, ranks dense per jetty */
+        let n = 4;
+        let mut seen = [0u64; 4];
+        for i in 0..40u64 {
+            let j = bw_op_jetty(i, n, 1);
+            assert_eq!(j, (i % n) as usize);
+            assert_eq!(bw_op_rank(i, n, 1), seen[j]);
+            seen[j] += 1;
+        }
+        assert_eq!(seen, [10; 4]);
+        /* chunked (list=3): runs of 3 ops per jetty; ranks stay dense and
+           continue correctly across chunk boundaries */
+        let (n, list) = (2u64, 3u64);
+        let mut seen = [0u64; 2];
+        for i in 0..30u64 {
+            let j = bw_op_jetty(i, n, list);
+            assert_eq!(j, ((i / list) % n) as usize);
+            assert_eq!(bw_op_rank(i, n, list), seen[j]);
+            seen[j] += 1;
+        }
+        assert_eq!(seen, [15; 2]);
     }
 }

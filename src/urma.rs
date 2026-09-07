@@ -902,6 +902,67 @@ impl Jetty {
         )
     }
 
+    /// Post a batch of one-sided READs as ONE linked work-request list:
+    /// `urma_post_jetty_send_wr` walks `wr->next`, so the whole list costs a
+    /// single queue-lock + doorbell (perftest's post_list). At small message
+    /// sizes the per-post cost is what caps a single-threaded poster's ops
+    /// rate; batching amortizes it (the provider bounds the list by the
+    /// queue's free WQE slots, erroring when the ring is full). Each entry
+    /// has the semantics of [`Jetty::post_read_signaled`] with exactly one
+    /// local sge.
+    pub fn post_read_list(&self, peer: &Peer, reqs: &[ReadReq<'_>]) -> Result<()> {
+        if reqs.is_empty() {
+            return Err(Error::Invalid("empty READ list".into()));
+        }
+        /* materialized only once len is final, then wired through raw
+           pointers (a next chain aliases the vec's own elements) */
+        let mut remote_sges = Vec::with_capacity(reqs.len());
+        let mut local_sges = Vec::with_capacity(reqs.len());
+        let mut wrs: Vec<ffi::urma_jfs_wr_t> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            remote_sges.push(ffi::urma_sge_t {
+                addr: r.remote_va,
+                len: r.local.len,
+                tseg: peer.tseg.as_ptr(),
+                ..Default::default()
+            });
+            local_sges.push(r.local.to_ffi());
+            wrs.push(ffi::urma_jfs_wr_t {
+                opcode: ffi::URMA_OPC_READ,
+                flag: ffi::urma_jfs_wr_flag_t {
+                    value: if r.signaled {
+                        ffi::URMA_JFS_WR_FLAG_COMPLETE_ENABLE | ffi::URMA_JFS_WR_FLAG_COMP_ORDER
+                    } else {
+                        0
+                    },
+                },
+                tjetty: peer.tjetty.as_ptr(),
+                user_ctx: r.user_ctx,
+                rw: ffi::urma_rw_wr_t::default(),
+                next: std::ptr::null_mut(),
+            });
+        }
+        let (rbase, lbase, wbase) =
+            (remote_sges.as_mut_ptr(), local_sges.as_mut_ptr(), wrs.as_mut_ptr());
+        for i in 0..wrs.len() {
+            unsafe {
+                (*wbase.add(i)).rw = ffi::urma_rw_wr_t {
+                    src: ffi::urma_sg_t { sge: rbase.add(i), num_sge: 1 },
+                    dst: ffi::urma_sg_t { sge: lbase.add(i), num_sge: 1 },
+                    ..Default::default()
+                };
+                if i + 1 < wrs.len() {
+                    (*wbase.add(i)).next = wbase.add(i + 1);
+                }
+            }
+        }
+        let mut bad_wr: *mut ffi::urma_jfs_wr_t = std::ptr::null_mut();
+        check_status(
+            unsafe { ffi::urma_post_jetty_send_wr(self.raw.as_ptr(), &mut wrs[0], &mut bad_wr) },
+            "urma_post_jetty_send_wr(READ list)",
+        )
+    }
+
     /// Post one two-sided SEND: send the local sge list (gather) to `peer`'s
     /// receive buffer (posted beforehand via [`Jetty::post_recv`]). Both sides
     /// get a completion record: local send completion means "data consumed by
@@ -1341,6 +1402,21 @@ impl<'a> LocalSge<'a> {
             ..Default::default()
         }
     }
+}
+
+/// One entry of a [`Jetty::post_read_list`] batch: a one-sided READ with
+/// exactly one local sge, the `signaled` semantics of
+/// [`Jetty::post_read_signaled`]
+#[derive(Clone, Copy)]
+pub struct ReadReq<'a> {
+    /// contiguous remote range start (on the peer's registered segment)
+    pub remote_va: u64,
+    /// local landing window (one sge)
+    pub local: LocalSge<'a>,
+    /// completion tag, returned in the completion record of signaled entries
+    pub user_ctx: u64,
+    /// whether this entry generates a completion record
+    pub signaled: bool,
 }
 
 #[cfg(test)]

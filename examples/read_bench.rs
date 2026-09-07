@@ -20,15 +20,22 @@
 //! `read-urma --depth N` (default 1) switches the URMA side from the
 //! serialized latency measurement to a pipelined bandwidth one, in
 //! urma_perftest read_bw's style: up to N READs in flight, post-one /
-//! reap-one, landing offsets cycled through the disjoint windows of the
-//! landing buffer (perftest's cycle buffer; past the window count the
-//! in-flight READs overlap — they carry identical source bytes, and the
-//! timed loop never checks data, the serialized verify pass does). Reported
-//! per size instead of the latency percentiles: average BW over the whole
-//! first-post→last-completion window, peak BW from the fastest single
-//! post→completion, and Mops — perftest's read_bw columns, so the numbers
-//! are directly comparable. TCP stays at depth 1 by construction (a
-//! request/response pair cannot pipeline), which is itself the gap.
+//! reap-one. Both transfer ends rotate through their disjoint windows per
+//! op — the landing buffer is registered at size×depth when memory allows
+//! (capped at 1 GiB, with a note when the cap bites), and the remote side
+//! cycles the peer's segment, so start serve-urma with a `--buf-len` above
+//! the sweep max to widen the remote rotation too; hammering one address
+//! range saturates that memory region, not the link. Reported per size
+//! instead of the latency percentiles: average BW over the whole
+//! first-post→last-completion window and Mops. There is deliberately no
+//! peak column: in a full pipeline every per-op post→completion window
+//! contains queueing time, so a "fastest op" is pipeline noise, not a
+//! fabric property. `--duration S` runs each size to a seconds-long
+//! deadline instead of `--iters` ops (warmup becomes a fixed 1s) — with
+//! iteration counts, a big-size row's window shrinks to tens of ms and one
+//! scheduler hiccup dominates the average. TCP stays at depth 1 by
+//! construction (a request/response pair cannot pipeline), which is itself
+//! the gap.
 //!
 //! serve-urma/read-urma follow urma_cli's pure flow (the descriptor travels
 //! as one hand-packed hex line, imports use the export blobs; defaults are
@@ -41,9 +48,9 @@
 //!         --sizes 8..16m   # serve sizes its buffer to the sweep's maximum
 //!
 //! # URMA READ bandwidth: same sweep, pipelined depth (perftest read_bw style):
-//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m
+//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m --buf-len 64m
 //! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
-//!         --sizes 4k..1m --depth 32
+//!         --sizes 4k..1m --depth 32 --duration 10
 //!
 //! # TCP reference over the same pair of machines:
 //! nodeA$ cargo run --example read_bench -- serve-tcp
@@ -76,6 +83,13 @@ const CONNECT_TRIES: u32 = 50;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(200);
 /// default serve-side buffer, bytes (raise --buf-len to sweep larger sizes)
 const DEFAULT_BUF_LEN: usize = 1048576;
+/// warmup length in --duration mode (bandwidth): long enough to reach steady
+/// state at every size, unlike a fixed op count whose duration shrinks with
+/// the size
+const BW_WARMUP: Duration = Duration::from_secs(1);
+/// landing-buffer ceiling for bandwidth mode (size x depth, capped): keeps a
+/// 16m x 64-style sweep from demanding GiBs of registered memory
+const BW_LANDING_CAP: usize = 1 << 30;
 
 #[derive(Parser)]
 #[command(
@@ -83,13 +97,14 @@ const DEFAULT_BUF_LEN: usize = 1048576;
     version,
     about = "READ-semantics latency/bandwidth benchmark: URMA one-sided READ vs TCP \
              request/response, swept over message sizes (min/p50/avg/p99/max per size; \
-             read-urma --depth N>1 pipelines N outstanding READs and reports avg/peak \
-             MiB/s + Mops instead)",
+             read-urma --depth N>1 pipelines N outstanding READs and reports avg MiB/s + \
+             Mops instead; --duration switches to seconds-long windows)",
     after_help = "READ semantics comparison: a URMA READ is one-sided (the server CPU sleeps); \
                   TCP has no one-sided op, so a read is emulated as a 4-byte length request + \
                   N-byte response round trip. Both transports share the sweep, the verify pass \
                   and the warmup. read-urma --depth>1 switches the URMA side to a pipelined \
-                  bandwidth measurement (urma_perftest read_bw's columns). \
+                  bandwidth measurement (urma_perftest read_bw's measurement, both transfer \
+                  ends rotating their windows; --duration for stable long windows). \
                   scripts/test_readbench.sh runs the full matrix."
 )]
 struct Cli {
@@ -140,7 +155,8 @@ struct BenchArgs {
     /// untimed iterations per size, before the timed loop
     #[arg(long, default_value_t = 100)]
     warmup: u32,
-    /// print csv,transport,size_bytes,iters,min_us,p50_us,avg_us,p99_us,max_us rows
+    /// print csv rows instead of the table (schema in the header line:
+    /// latency percentiles, or ops/depth/bw_avg_mib/mops in bandwidth mode)
     #[arg(long)]
     csv: bool,
 }
@@ -166,10 +182,16 @@ struct ReadUrmaArgs {
     #[command(flatten)]
     bench: BenchArgs,
     /// outstanding READs: 1 = latency mode (serialized, default); >1 = bandwidth
-    /// mode - up to this many READs in flight, reported as avg/peak MiB/s + Mops
+    /// mode - up to this many READs in flight, reported as avg MiB/s + Mops
     /// instead of latency percentiles (bounded by the jetty/CQ depth, 64)
     #[arg(long, default_value_t = 1)]
     depth: u32,
+    /// timed window per size in seconds, bandwidth mode only (0 = off): each
+    /// size runs to this deadline instead of --iters ops, then the in-flight
+    /// READs drain - a window long enough that one scheduler hiccup cannot
+    /// dominate the average; --warmup becomes a fixed 1s in this mode
+    #[arg(long, default_value_t = 0)]
+    duration: u64,
 }
 
 #[derive(Args)]
@@ -311,6 +333,14 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
              more outstanding READs than that would overflow the queues"
         )));
     }
+    if a.duration > 0 && a.depth == 1 {
+        return Err(Error::Invalid(
+            "--duration needs bandwidth mode: pass --depth > 1 (latency mode counts iterations, \
+             not seconds)"
+                .into(),
+        ));
+    }
+    let duration = (a.duration > 0).then_some(a.duration);
 
     println!("[read-urma] unpack peer descriptor");
     let desc_hex = if a.desc == "-" {
@@ -376,15 +406,37 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     let peer = Peer::import_ctx(&ctx, &wire.seg_ctx, &wire.rjetty, tp, TOKEN_VALUE)?;
 
     let max_size = *sizes.last().unwrap();
+    /* bandwidth mode registers size x depth of landing (capped) so the
+       pipeline gets disjoint landing windows; the remote end rotates the
+       peer's segment — give serve-urma a --buf-len above the sweep max to
+       widen that rotation too */
+    let landing_len = if a.depth > 1 {
+        let want = max_size.saturating_mul(a.depth as usize);
+        let capped = want.min(BW_LANDING_CAP);
+        if capped < want {
+            println!(
+                "[read-urma] note: landing capped at {capped} bytes ({max_size} x depth {} would be {want}); the top sizes overlap windows",
+                a.depth
+            );
+        }
+        println!(
+            "[read-urma] bandwidth mode: depth {}, landing {capped} bytes, remote rotation within the {}-byte peer segment",
+            a.depth,
+            wire.seg.len
+        );
+        capped
+    } else {
+        max_size
+    };
     println!(
-        "[4/4] register landing buffer ({max_size} bytes), sweep {} sizes: {}",
+        "[4/4] register landing buffer ({landing_len} bytes), sweep {} sizes: {}",
         sizes.len(),
         sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
     );
-    let landing = RegisteredBuf::new(&ctx, max_size, TOKEN_VALUE)?;
+    let landing = RegisteredBuf::new(&ctx, landing_len, TOKEN_VALUE)?;
     let remote_va = wire.seg.va;
 
-    print_header("urma", a.bench.iters, a.bench.warmup, a.depth, a.bench.csv);
+    print_header("urma", a.bench.iters, a.bench.warmup, a.depth, a.duration, a.bench.csv);
     for &size in &sizes {
         let sge = landing.sge(0, size as u32)?;
         /* verify pass outside the timed loop: one serialized READ, compare the
@@ -404,12 +456,24 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
             )?;
             print_row("urma", size, a.bench.iters, &s, a.bench.csv);
         } else {
-            let bw = BwCtx { jetty: &jetty, cq: &cq, peer: &peer, remote_va, landing: &landing };
-            let s = run_bw_iters(&bw, size, a.depth, a.bench.warmup, a.bench.iters)?;
-            print_bw_row("urma", size, a.bench.iters, a.depth, &s, a.bench.csv);
+            let bw = BwCtx {
+                jetty: &jetty,
+                cq: &cq,
+                peer: &peer,
+                remote_va,
+                seg_len: wire.seg.len,
+                landing: &landing,
+            };
+            let s = run_bw_iters(&bw, size, a.depth, a.bench.warmup, a.bench.iters, duration)?;
+            print_bw_row("urma", size, a.depth, &s, a.bench.csv);
         }
     }
-    println!("[read-urma] done: {} sizes, {} iters each", sizes.len(), a.bench.iters);
+    let per = if a.depth > 1 && a.duration > 0 {
+        format!("{}s window", a.duration)
+    } else {
+        format!("{} iters", a.bench.iters)
+    };
+    println!("[read-urma] done: {} sizes, {per} each", sizes.len());
     Ok(())
 }
 
@@ -440,58 +504,72 @@ struct BwCtx<'a> {
     cq: &'a CompletionQueue,
     peer: &'a Peer,
     remote_va: u64,
+    /// peer segment length: the remote rotation window
+    seg_len: u64,
     landing: &'a RegisteredBuf,
 }
 
 /// landing offset for op `i` of the bandwidth loop: the `len/size` disjoint
-/// windows of the landing buffer, cycled per op (perftest's cycle buffer).
-/// With one window (size = whole buffer) the in-flight READs overlap —
-/// fine: they carry identical source bytes, and the timed loop never checks
-/// data (the serialized verify pass does), matching perftest's practice.
+/// windows of the buffer, cycled per op (perftest's cycle buffer, applied to
+/// BOTH transfer ends — same source bytes every op is what saturates a
+/// single memory region instead of the link). With one window (size = whole
+/// buffer) the in-flight READs overlap — fine: identical source bytes, and
+/// the timed loop never checks data (the serialized verify pass does),
+/// matching perftest's practice.
 fn bw_slot_off(i: u64, size: usize, len: usize) -> usize {
     let slots = (len / size).max(1) as u64;
     ((i % slots) as usize) * size
 }
 
-/// one pipelined pass of `count` READs with up to `depth` in flight: post
-/// while the pipeline is not full, reap completions as they land (each one
-/// frees a slot for the next post). A timed pass returns the first-post
-/// Instant plus the fastest post→completion window — the caller derives avg
-/// and peak from them. user_ctx carries the op index, so a completion
-/// resolves to its own post timestamp (completions may arrive out of order;
-/// posts never are, hence the Vec). The hang guard resets on every
-/// completion: it bounds silence, not the pass (a big sweep runs long).
+/// when a bandwidth pass stops posting: after `ops` posts, or at a deadline.
+/// The Until arm always allows at least one post, so a timed pass always has
+/// a window to report.
+enum BwStop {
+    Ops(u64),
+    Until(Instant),
+}
+
+impl BwStop {
+    fn stop_posting(&self, next: u64) -> bool {
+        match self {
+            BwStop::Ops(n) => next >= *n,
+            BwStop::Until(t) => next > 0 && Instant::now() >= *t,
+        }
+    }
+}
+
+/// one pipelined pass: post while the pipeline is not full and the stop
+/// condition allows, reap completions as they land (each one frees a slot
+/// for the next post). A timed pass returns its whole
+/// first-post→last-completion window plus the completed-op count.
+/// Completions only need counting — no per-op timestamps: in a full
+/// pipeline every post→completion window contains queueing time, so per-op
+/// figures are pipeline noise, not fabric properties. The hang guard resets
+/// on every completion: it bounds silence, not the pass (a duration pass
+/// runs long by design).
 fn bw_pass(
-    bw: &BwCtx, size: usize, depth: u32, count: u64, timed: bool,
-) -> Result<Option<(Instant, Duration)>> {
-    let mut posted: Vec<Instant> = Vec::with_capacity(if timed { count as usize } else { 0 });
+    bw: &BwCtx, size: usize, depth: u32, stop: &BwStop, timed: bool,
+) -> Result<Option<(Duration, u64)>> {
     let (mut next, mut done) = (0u64, 0u64);
     let mut t0 = None;
-    let mut min_op = Duration::MAX;
     let mut deadline = Instant::now() + READ_TIMEOUT;
-    while done < count {
-        while next < count && next - done < depth as u64 {
+    loop {
+        while !stop.stop_posting(next) && next - done < u64::from(depth) {
             let off = bw_slot_off(next, size, bw.landing.len());
-            bw.jetty.post_read(bw.peer, bw.remote_va, &[bw.landing.sge(off, size as u32)?], next)?;
-            if timed {
-                let now = Instant::now();
-                if next == 0 {
-                    t0 = Some(now);
-                }
-                posted.push(now);
+            let va = bw.remote_va + bw_slot_off(next, size, bw.seg_len as usize) as u64;
+            bw.jetty.post_read(bw.peer, va, &[bw.landing.sge(off, size as u32)?], READ_CTX)?;
+            if timed && next == 0 {
+                t0 = Some(Instant::now());
             }
             next += 1;
         }
+        if done == next && stop.stop_posting(next) {
+            break;
+        }
         match bw.cq.poll()? {
             Some(cr) => {
-                if !cr.is_success() || cr.user_ctx >= next {
+                if !cr.is_success() {
                     return Err(Error::BadCompletion { status: cr.status, user_ctx: cr.user_ctx });
-                }
-                if timed {
-                    let d = posted[cr.user_ctx as usize].elapsed();
-                    if d < min_op {
-                        min_op = d;
-                    }
                 }
                 done += 1;
                 deadline = Instant::now() + READ_TIMEOUT;
@@ -504,18 +582,29 @@ fn bw_pass(
             }
         }
     }
-    Ok(if timed { Some((t0.expect("timed pass posts op 0"), min_op)) } else { None })
+    Ok(t0.map(|t0| (t0.elapsed(), done)))
 }
 
-/// bandwidth counterpart of `run_iters`: warmup pass untimed, then the timed
-/// pass over the whole first-post→last-completion window
-fn run_bw_iters(bw: &BwCtx, size: usize, depth: u32, warmup: u32, iters: u32) -> Result<BwStats> {
-    if warmup > 0 {
-        bw_pass(bw, size, depth, warmup as u64, false)?;
+/// bandwidth counterpart of `run_iters`: an untimed warmup pass, then the
+/// timed one. Op-count mode uses --warmup/--iters; duration mode warms up a
+/// fixed 1s and then runs to a seconds-long deadline — a window long enough
+/// that one scheduler hiccup cannot dominate the average.
+fn run_bw_iters(
+    bw: &BwCtx, size: usize, depth: u32, warmup: u32, iters: u32, duration: Option<u64>,
+) -> Result<BwStats> {
+    let (warm_stop, main_stop) = match duration {
+        Some(secs) => (
+            BwStop::Until(Instant::now() + BW_WARMUP),
+            BwStop::Until(Instant::now() + Duration::from_secs(secs)),
+        ),
+        None => (BwStop::Ops(u64::from(warmup)), BwStop::Ops(u64::from(iters))),
+    };
+    if matches!(warm_stop, BwStop::Ops(n) if n > 0) {
+        bw_pass(bw, size, depth, &warm_stop, false)?;
     }
-    let (t0, min_op) =
-        bw_pass(bw, size, depth, iters as u64, true)?.expect("timed pass returns its window");
-    Ok(bw_stats(size, iters, t0.elapsed(), min_op))
+    let (window, ops) =
+        bw_pass(bw, size, depth, &main_stop, true)?.expect("timed pass posts at least one op");
+    Ok(bw_stats(size, ops, window))
 }
 
 /* ---- mode preflight (urma_cli's, plus the cap for the size filter) ---- */
@@ -624,7 +713,7 @@ fn read_tcp_run(a: &ReadTcpArgs) -> Result<()> {
 
     let max_size = *sizes.last().unwrap();
     let mut rbuf = vec![0u8; max_size];
-    print_header("tcp", a.bench.iters, a.bench.warmup, 1, a.bench.csv);
+    print_header("tcp", a.bench.iters, a.bench.warmup, 1, 0, a.bench.csv);
     for &size in &sizes {
         let req = (size as u32).to_le_bytes();
         /* verify pass outside the timed loop, same policy as the URMA side */
@@ -790,41 +879,43 @@ fn stats(samples: &[Duration]) -> Stats {
     }
 }
 
-/// one bandwidth report row (read-urma --depth>1): avg and peak in MiB/s
-/// (binary, matching the k/m size suffixes), ops per second in millions.
-/// avg = bytes over the whole first-post→last-completion window, the number
-/// a streaming consumer sees; peak = the fastest single post→completion
-/// window — perftest read_bw's BW average / BW peak, for comparability.
+/// one bandwidth report row (read-urma --depth>1): avg in MiB/s (binary,
+/// matching the k/m size suffixes) and ops per second in millions, both over
+/// the whole first-post→last-completion window — the numbers a streaming
+/// consumer sees. No peak: in a full pipeline every per-op post→completion
+/// window contains queueing time, so a "fastest op" is pipeline noise, not
+/// a fabric property (perftest's BW peak has the same artifact).
 struct BwStats {
+    ops: u64,
     avg: f64,
-    peak: f64,
     mops: f64,
 }
 
-/// pure math behind [`BwStats`], split out for the unit test. The min window
-/// is clamped to 1ns so a zero-resolution clock cannot produce an inf peak.
-fn bw_stats(size: usize, iters: u32, total: Duration, min_op: Duration) -> BwStats {
+/// pure math behind [`BwStats`], split out for the unit test
+fn bw_stats(size: usize, ops: u64, total: Duration) -> BwStats {
     let secs = total.as_secs_f64();
-    let min_op = min_op.max(Duration::from_nanos(1));
     BwStats {
-        avg: size as f64 * iters as f64 / secs / (1024.0 * 1024.0),
-        peak: size as f64 / min_op.as_secs_f64() / (1024.0 * 1024.0),
-        mops: iters as f64 / secs / 1e6,
+        ops,
+        avg: size as f64 * ops as f64 / secs / (1024.0 * 1024.0),
+        mops: ops as f64 / secs / 1e6,
     }
 }
 
-fn print_header(transport: &str, iters: u32, warmup: u32, depth: u32, csv: bool) {
+fn print_header(transport: &str, iters: u32, warmup: u32, depth: u32, duration: u64, csv: bool) {
     if csv {
         if depth > 1 {
-            println!("csv,transport,size_bytes,iters,depth,bw_avg_mib,bw_peak_mib,mops");
+            println!("csv,transport,size_bytes,ops,depth,bw_avg_mib,mops");
         } else {
             println!("csv,transport,size_bytes,iters,min_us,p50_us,avg_us,p99_us,max_us");
         }
     } else if depth > 1 {
-        println!(
-            "== {transport} READ bandwidth: depth {depth}, {iters} iters + {warmup} warmup per size, MiB/s =="
-        );
-        println!("{:>10} {:>10} {:>10} {:>10}", "size", "avg", "peak", "Mops");
+        let mode = if duration > 0 {
+            format!("{duration}s window + 1s warmup")
+        } else {
+            format!("{iters} iters + {warmup} warmup")
+        };
+        println!("== {transport} READ bandwidth: depth {depth}, {mode} per size, MiB/s ==");
+        println!("{:>10} {:>10} {:>10}", "size", "avg", "Mops");
     } else {
         println!("== {transport} READ latency: {iters} iters + {warmup} warmup per size, µs ==");
         println!("{:>10} {:>10} {:>10} {:>10} {:>10} {:>10}", "size", "min", "p50", "avg", "p99", "max");
@@ -842,11 +933,11 @@ fn print_row(transport: &str, size: usize, iters: u32, s: &Stats, csv: bool) {
     }
 }
 
-fn print_bw_row(transport: &str, size: usize, iters: u32, depth: u32, s: &BwStats, csv: bool) {
+fn print_bw_row(transport: &str, size: usize, depth: u32, s: &BwStats, csv: bool) {
     if csv {
-        println!("csv,{transport},{size},{iters},{depth},{:.2},{:.2},{:.3}", s.avg, s.peak, s.mops);
+        println!("csv,{transport},{size},{},{depth},{:.2},{:.3}", s.ops, s.avg, s.mops);
     } else {
-        println!("{:>10} {:>10.2} {:>10.2} {:>10.3}", size, s.avg, s.peak, s.mops);
+        println!("{:>10} {:>10.2} {:>10.3}", size, s.avg, s.mops);
     }
 }
 
@@ -1066,15 +1157,15 @@ mod tests {
 
     #[test]
     fn bw_stats_math() {
-        /* 1000x4096B over a 10ms window = 409.6MB/s = 390.625 MiB/s;
-           fastest single op 5µs -> 819.2MB/s = 781.25 MiB/s; 0.1 Mops */
-        let s = bw_stats(4096, 1000, Duration::from_millis(10), Duration::from_micros(5));
+        /* 1000x4096B over a 10ms window = 409.6MB/s = 390.625 MiB/s; 0.1 Mops */
+        let s = bw_stats(4096, 1000, Duration::from_millis(10));
+        assert_eq!(s.ops, 1000);
         assert!((s.avg - 390.625).abs() < 1e-6);
-        assert!((s.peak - 781.25).abs() < 1e-6);
         assert!((s.mops - 0.1).abs() < 1e-9);
-        /* a zero-duration window (clock resolution) must not become an inf peak */
-        let s = bw_stats(8, 1, Duration::from_secs(1), Duration::ZERO);
-        assert!(s.peak.is_finite());
+        /* duration mode counts ops itself; avg stays bytes over the window */
+        let s = bw_stats(65536, 3_000_000, Duration::from_secs(10));
+        assert!((s.avg - 65536.0 * 300_000.0 / (1024.0 * 1024.0)).abs() < 1e-6);
+        assert!((s.mops - 0.3).abs() < 1e-9);
     }
 
     #[test]

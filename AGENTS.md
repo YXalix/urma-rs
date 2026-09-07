@@ -21,8 +21,12 @@ plus example demos.
   `serve-urma`/`read-urma` + `serve-tcp`/`read-tcp`, per-size verify pass +
   warmup + timed iters, busy-poll of the CQ, never `wait_read`'s 100ms
   sleep poll; `read-urma --depth N>1` switches the URMA side to a
-  pipelined bandwidth measurement — up to N outstanding READs, perftest
-  read_bw-style avg/peak MiB/s + Mops columns); shared helpers
+  pipelined bandwidth measurement — up to N outstanding READs, both
+  transfer ends rotating their windows (landing registered at size×depth,
+  capped 1 GiB; remote cycles the peer segment), avg MiB/s + Mops, no
+  peak (per-op windows contain queueing time in a full pipeline);
+  `--duration S` runs seconds-long windows instead of `--iters` ops);
+  shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
 - `docs/urma.md` — URMA background concepts (resource model, transport
@@ -46,6 +50,8 @@ cargo clippy --examples
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
 ./scripts/test_readbench.sh  # read_bench benchmark: TCP loopback always; with
                             # UB_NODES also cross-node TCP + URMA READ matrix
+                            # (DEPTH/DUR knobs pass --depth/--duration to
+                            # read-urma: bandwidth mode + long windows)
 ./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
                             # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),
                             # SKIPs when unset (UB has no loopback)

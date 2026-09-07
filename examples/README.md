@@ -15,7 +15,7 @@ logic testing without a URMA device.
 | `urma_lookup` | record directory: HTTP-only master assigns id ranges, clients fetch records from each other P2P | one-sided READ; data plane bypasses the master |
 | `list_devices` | prints URMA device names, one per line | probe tool (`urma_get_device_list`), exit 0 iff a device exists; `--caps` appends each device's supported communication-mode matrix (`urma_query_device`) |
 | `urma_cli` | minimal pure-URMA CLI, the single-file usage example of the whole API | `list [--caps]` device probe, `serve`/`read` one-sided READ where the descriptor travels by manual copy-paste (no HTTP control plane at all); `--mode`/`--tp` select any advertised communication combination, both sides must agree |
-| `read_bench` | READ-latency/bandwidth benchmark: URMA one-sided READ vs TCP, swept over message sizes | URMA: `post_read` + busy-polled completion (server CPU uninvolved); TCP has no one-sided op, so a read is emulated as a 4-byte length request + N-byte response round trip (TCP_NODELAY on both ends); per size one verify pass + warmup + timed iters, reported as min/p50/avg/p99/max (`--csv` for machine-readable rows); `read-urma --depth N>1` switches to a pipelined bandwidth measurement (avg/peak MiB/s + Mops, urma_perftest read_bw's columns); same pure-std style as `urma_cli` |
+| `read_bench` | READ-latency/bandwidth benchmark: URMA one-sided READ vs TCP, swept over message sizes | URMA: `post_read` + busy-polled completion (server CPU uninvolved); TCP has no one-sided op, so a read is emulated as a 4-byte length request + N-byte response round trip (TCP_NODELAY on both ends); per size one verify pass + warmup + timed iters, reported as min/p50/avg/p99/max (`--csv` for machine-readable rows); `read-urma --depth N>1` switches to a pipelined bandwidth measurement (both transfer ends rotating their windows, avg MiB/s + Mops, `--duration` for seconds-long windows); same pure-std style as `urma_cli` |
 
 ## Conventions
 
@@ -149,10 +149,12 @@ nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 8..
 nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
         --sizes 8..16m
 
-# URMA READ bandwidth: same serve side, reader pipelines --depth READs:
-nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m
+# URMA READ bandwidth: same serve side, reader pipelines --depth READs;
+# give serve a --buf-len above the sweep max so the reader can rotate the
+# remote window too, and use --duration for seconds-long stable windows:
+nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m --buf-len 64m
 nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
-        --sizes 4k..1m --depth 32
+        --sizes 4k..1m --depth 32 --duration 10
 ```
 
 `--sizes` (comma list `8,64,1k` or doubling range `8..16m`, k/m/g
@@ -165,13 +167,19 @@ tables side by side.
 
 `read-urma --depth N` (default 1) turns the URMA side into a bandwidth
 measurement in urma_perftest read_bw's style: up to N (≤ 64, the
-jetty/CQ depth) READs in flight, post-one/reap-one, landing offsets
-cycled through the buffer's disjoint windows (past the window count the
-in-flight READs overlap — identical source bytes, and the timed loop
-never checks data; the verify pass stays serialized). Each size then
-reports average BW over the whole first-post→last-completion window,
-peak BW from the fastest single post→completion, and Mops instead of
-latency percentiles; the `--csv` schema changes accordingly
-(`bw_avg_mib,bw_peak_mib,mops`). TCP stays at depth 1 by construction —
-a request/response pair cannot pipeline, which is itself the semantic
-gap.
+jetty/CQ depth) READs in flight, post-one/reap-one. Both transfer ends
+rotate through their disjoint windows per op — the reader registers a
+size×depth landing buffer (capped at 1 GiB, with a note when the cap
+bites; give serve-urma a `--buf-len` above the sweep max to widen the
+remote rotation, since hammering one address range saturates that memory
+region rather than the link). Each size reports average BW over the whole
+first-post→last-completion window plus Mops — deliberately no peak
+column: in a full pipeline every per-op post→completion window contains
+queueing time, so a "fastest op" is pipeline noise; the `--csv` schema
+changes accordingly (`ops,depth,bw_avg_mib,mops`). The verify pass stays
+serialized. `--duration S` runs each size to a seconds-long deadline
+instead of `--iters` ops (warmup becomes a fixed 1s): with iteration
+counts a big-size row's window shrinks to tens of milliseconds and one
+scheduler hiccup dominates the average. TCP stays at depth 1 by
+construction — a request/response pair cannot pipeline, which is itself
+the semantic gap.

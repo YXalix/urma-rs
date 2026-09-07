@@ -70,12 +70,19 @@
 //!
 //! serve-urma/read-urma follow urma_cli's pure flow (the descriptor travels
 //! as one hand-packed hex line, imports use the export blobs; defaults are
-//! CTP-RM like every example):
+//! CTP-RM like every example). `write-urma` runs the same sweep for the
+//! other one-sided direction (perftest write_bw): the landing buffer
+//! becomes the local SOURCE and the peer's segment the destination, verify
+//! flips into one serialized WRITE + READ-back, and every bandwidth knob
+//! (depth/jetties/post-list/cq-mod/landing-cap/duration) carries over —
+//! the READ-vs-WRITE sustained-bandwidth asymmetry is then a same-tool,
+//! same-conditions comparison. WRITEs overwrite the serve's pattern, so
+//! restart serve-urma before a read-urma verify against the same segment.
 //!
 //! ```bash
 //! # URMA READ latency between two nodes:
-//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 8..16m
-//! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
+//! nodeA$ cargo run --example urma_bench -- serve-urma -d bonding_dev_0 --sizes 8..16m
+//! nodeB$ cargo run --example urma_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
 //!         --sizes 8..16m   # serve sizes its buffer to the sweep's maximum
 //!
 //! # URMA READ bandwidth: same sweep, pipelined depth (perftest read_bw style).
@@ -83,19 +90,25 @@
 //! # 4K still plateaus around 2 Mops, chain posts (--post-list) and only then
 //! # add parallel jettys (--jetties on BOTH sides) to tell a poster-CPU
 //! # ceiling from a per-jetty fabric IOPS one:
-//! nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m \
+//! nodeA$ cargo run --example urma_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m \
 //!         --buf-len 512m --jetties 4
-//! nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
+//! nodeB$ cargo run --example urma_bench -- read-urma -d bonding_dev_0 '<[desc] hex>' \
 //!         --sizes 4k..1m --depth 512 --post-list 32 --jetties 4 --duration 10
 //!
 //! # TCP reference over the same pair of machines:
-//! nodeA$ cargo run --example read_bench -- serve-tcp
-//! nodeB$ cargo run --example read_bench -- read-tcp --addr <ipA>
+//! nodeA$ cargo run --example urma_bench -- serve-tcp
+//! nodeB$ cargo run --example urma_bench -- read-tcp --addr <ipA>
+//!
+//! # URMA WRITE bandwidth (perftest write_bw, same knobs): the asymmetry
+//! # probe next to the READ number above.
+//! nodeA$ cargo run --example urma_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m \
+//! #        --buf-len 512m --jetties 4
+//! nodeB$ cargo run --example urma_bench -- write-urma -d bonding_dev_0 '<[desc] hex>' \
+//! #        --sizes 4k..1m --depth 512 --post-list 32 --jetties 4 --duration 10
 //! ```
 //!
-//! `scripts/test_readbench.sh` automates the matrix: TCP loopback as a local
-//! smoke test, plus both transports across a UB_NODES pair. `--csv` prints
-//! `csv,transport,size_bytes,...` rows for plotting instead of the table.
+//! `--csv` prints `csv,transport,size_bytes,...` rows for plotting instead
+//! of the table.
 
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -105,8 +118,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use urma_rs::{
     query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Error, Jetty, JettyOpts,
-    Peer, ReadReq, RegisteredBuf, Result, SegDesc, TpType, TransMode, Urma, DEFAULT_DEPTH,
-    TOKEN_VALUE, URMA_MAX_PRIORITY,
+    Peer, ReadReq, RegisteredBuf, Result, SegDesc, TpType, TransMode, Urma, WriteReq,
+    DEFAULT_DEPTH, TOKEN_VALUE, URMA_MAX_PRIORITY,
 };
 
 /// user_ctx tag for every READ (strictly one outstanding op at a time)
@@ -149,22 +162,21 @@ const BW_FENCE_CTX_MIN: u64 = BW_FENCE_CTX_BASE - (BW_MAX_JETTIES - 1) as u64;
 
 #[derive(Parser)]
 #[command(
-    name = "read_bench",
+    name = "urma_bench",
     version,
-    about = "READ-semantics latency/bandwidth benchmark: URMA one-sided READ vs TCP \
-             request/response, swept over message sizes (min/p50/avg/p99/max per size; \
-             read-urma --depth N>1 pipelines N outstanding READs and reports avg MiB/s + \
-             Mops instead; --duration switches to seconds-long windows)",
+    about = "One-sided READ/WRITE latency/bandwidth benchmark: URMA vs the TCP \
+             request/response emulation, swept over message sizes (min/p50/avg/p99/max per \
+             size; read-urma/write-urma --depth N>1 pipeline N outstanding ops and report \
+             avg MiB/s + Mops instead; --duration switches to seconds-long windows)",
     after_help = "READ semantics comparison: a URMA READ is one-sided (the server CPU sleeps); \
                   TCP has no one-sided op, so a read is emulated as a 4-byte length request + \
                   N-byte response round trip. Both transports share the sweep, the verify pass \
-                  and the warmup. read-urma --depth>1 switches the URMA side to a pipelined \
-                  bandwidth measurement (urma_perftest read_bw's measurement: both transfer \
-                  ends rotating their windows, batched completion reaping, --cq-mod completion \
-                  moderation for small sizes, depth bounded by the device's queue caps, \
-                  --post-list chained posts and --jetties parallel streams for the ops-rate \
-                  ceiling; --duration for stable long windows). scripts/test_readbench.sh \
-                  runs the full matrix."
+                  and the warmup. read-urma/write-urma --depth>1 switches the URMA side to a \
+                  pipelined bandwidth measurement (urma_perftest read_bw/write_bw's \
+                  measurement: both transfer ends rotating their windows, batched completion \
+                  reaping, --cq-mod completion moderation, depth bounded by the device's queue \
+                  caps, --post-list chained posts and --jetties parallel streams for the \
+                  ops-rate ceiling; --duration for stable long windows)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -176,7 +188,14 @@ enum Cmd {
     /// URMA serve: register pattern-filled memory, print the descriptor, hold it
     ServeUrma(ServeUrmaArgs),
     /// URMA client: import the peer's descriptor, timed one-sided READs per size
-    ReadUrma(ReadUrmaArgs),
+    ReadUrma(OneSidedArgs),
+    /// URMA client: timed one-sided WRITEs per size (perftest write_bw's
+    /// measurement, same knobs as read-urma): the landing buffer becomes the
+    /// local SOURCE, the peer's segment the destination; verification flips
+    /// direction — one serialized WRITE of the pattern, then a READ-back.
+    /// NOTE: WRITEs overwrite the serve's pattern, so restart serve-urma
+    /// before a read-urma verify pass against the same segment.
+    WriteUrma(OneSidedArgs),
     /// TCP reference serve: answer length requests with pattern bytes
     ServeTcp(ServeTcpArgs),
     /// TCP reference client: timed request/response round trips per size
@@ -245,8 +264,11 @@ struct ServeUrmaArgs {
     buf_len: Option<usize>,
 }
 
+/// one-sided op benchmark knobs shared by read-urma/write-urma: latency mode
+/// (--depth 1, serialized percentiles) or pipelined bandwidth mode
+/// (--depth > 1)
 #[derive(Args)]
-struct ReadUrmaArgs {
+struct OneSidedArgs {
     #[command(flatten)]
     mode: ModeArgs,
     /// the [desc] hex line printed by the peer's serve-urma ('-' reads one line from stdin)
@@ -365,7 +387,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let r = match &cli.cmd {
         Cmd::ServeUrma(a) => serve_urma_run(a),
-        Cmd::ReadUrma(a) => read_urma_run(a),
+        Cmd::ReadUrma(a) => one_sided_run(a, BwOp::Read),
+        Cmd::WriteUrma(a) => one_sided_run(a, BwOp::Write),
         Cmd::ServeTcp(a) => serve_tcp_run(a),
         Cmd::ReadTcp(a) => read_tcp_run(a),
     };
@@ -438,14 +461,14 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
     println!("[5/5] descriptor for the peer (one hex line):");
     println!("[desc] {}", pack_desc(&WireDesc { seg, seg_ctx, rjetty }));
 
-    /* one-sided READs never involve this CPU and raise no completion here;
-       the only remaining job is keeping the resources alive */
+    /* one-sided READs/WRITEs never involve this CPU and raise no completion
+       here; the only remaining job is keeping the resources alive */
     if std::io::stdin().is_terminal() {
-        println!("[serve-urma] holding the segment for the peer's READs - press Enter to exit");
+        println!("[serve-urma] holding the segment for the peer's READs/WRITEs - press Enter to exit");
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
     } else {
-        println!("[serve-urma] holding the segment for the peer's READs (stdin not a tty: park until killed)");
+        println!("[serve-urma] holding the segment for the peer's READs/WRITEs (stdin not a tty: park until killed)");
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -454,9 +477,15 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
     Ok(())
 }
 
-/* ============================== urma: read =============================== */
+/* ========================== urma: one-sided ops ========================== */
 
-fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
+/// read-urma / write-urma: identical flow, one BwOp apart — the cap filter
+/// (max_read_size vs max_write_size; WRITE additionally needs the READ
+/// fallback for its verify read-back), the verify pass direction, and the
+/// work request itself. Everything else (descriptor import, preflight,
+/// depth/jetties/post-list/cq-mod plumbing, rotation, reporting) is shared.
+fn one_sided_run(a: &OneSidedArgs, op: BwOp) -> Result<()> {
+    let tag = op.tag();
     let mut sizes = bench_sizes(&a.bench)?;
     if a.depth == 0 {
         return Err(Error::Invalid("--depth must be at least 1".into()));
@@ -470,7 +499,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     }
     if a.cq_mod > 0 && a.depth == 1 {
         return Err(Error::Invalid(
-            "--cq-mod needs bandwidth mode: pass --depth > 1 (a serialized READ cannot skip \
+            "--cq-mod needs bandwidth mode: pass --depth > 1 (a serialized op cannot skip \
              completion records)"
                 .into(),
         ));
@@ -494,7 +523,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     }
     let duration = (a.duration > 0).then_some(a.duration);
 
-    println!("[read-urma] unpack peer descriptor");
+    println!("[{tag}] unpack peer descriptor");
     let desc_hex = if a.desc == "-" {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).map_err(Error::Io)?;
@@ -531,25 +560,28 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
        READs at a drain sit on top of a full pipeline without overflowing
        any single queue */
     let qdepth = a.depth.max(DEFAULT_DEPTH) + a.jetties;
-    /* sizes above the READ ceiling are skipped with a note, not fatal: one
-       sweep then works on any device. A one-sided READ is bounded by the
-       device's max_read_size — max_msg_size caps two-sided messages, not
-       READs (urma_device_cap_t carries both); 0 = not reported, then fall
-       back to max_msg_size, then to no limit */
-    let read_cap = if cap.max_read_size != 0 {
-        cap.max_read_size
-    } else if cap.max_msg_size != 0 {
-        cap.max_msg_size
-    } else {
-        u64::MAX
+    /* sizes above the op's ceiling are skipped with a note, not fatal: one
+       sweep then works on any device. A one-sided op is bounded by the
+       device's max_read_size / max_write_size — max_msg_size caps
+       two-sided messages, not one-sided ops (urma_device_cap_t carries all
+       of them); 0 = not reported, then fall back to max_msg_size, then to
+       no limit. WRITE's verify pass reads the range back, so it needs BOTH
+       ceilings */
+    let op_cap = |v: u64| if v != 0 { v } else if cap.max_msg_size != 0 { cap.max_msg_size } else { u64::MAX };
+    let limit = match op {
+        BwOp::Read => op_cap(cap.max_read_size).min(wire.seg.len),
+        BwOp::Write => op_cap(cap.max_read_size).min(op_cap(cap.max_write_size)).min(wire.seg.len),
     };
-    let limit = read_cap.min(wire.seg.len);
     sizes.retain(|&s| {
         let ok = (s as u64) <= limit;
         if !ok {
             println!(
-                "[read-urma] skip size {s}: above the {limit}-byte READ ceiling (peer segment {}, device max_read_size {} / max_msg_size {})",
-                wire.seg.len, cap.max_read_size, cap.max_msg_size
+                "[{tag}] skip size {s}: above the {limit}-byte {} ceiling (peer segment {}, device max_read_size {} / max_write_size {} / max_msg_size {})",
+                op.label(),
+                wire.seg.len,
+                cap.max_read_size,
+                cap.max_write_size,
+                cap.max_msg_size
             );
         }
         ok
@@ -597,7 +629,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     }
     if wire.rjetty.len() > want {
         println!(
-            "[read-urma] note: descriptor carries {} rjetty blobs, using the first {want}",
+            "[{tag}] note: descriptor carries {} rjetty blobs, using the first {want}",
             wire.rjetty.len()
         );
     }
@@ -613,7 +645,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
        pipeline gets disjoint landing windows; the remote end rotates the
        peer's segment — give serve-urma a --buf-len above sweep-max x depth
        to widen that rotation too: fewer remote windows than the depth means
-       concurrent READs hammer one remote range and the measurement
+       concurrent ops hammer one remote range and the measurement
        saturates that memory, not the link */
     let landing_len = if a.depth > 1 {
         let want = max_size.saturating_mul(a.depth as usize);
@@ -621,21 +653,21 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
         if capped < want {
             let windows = (capped / max_size).max(1);
             println!(
-                "[read-urma] note: landing capped at {capped} bytes ({max_size} x depth {} would be {want}); \
-                 the {} in-flight READs share {windows} landing windows - raise --landing-cap for disjoint landings",
+                "[{tag}] note: landing capped at {capped} bytes ({max_size} x depth {} would be {want}); \
+                 the {} in-flight ops share {windows} landing windows - raise --landing-cap for disjoint landings",
                 a.depth, a.depth
             );
         }
         let remote_windows = wire.seg.len / max_size as u64;
         if remote_windows < u64::from(a.depth) {
             println!(
-                "[read-urma] note: remote rotation covers {remote_windows} x {max_size}-byte windows, \
-                 below depth {} - raise serve-urma --buf-len so concurrent READs do not hammer one remote range",
+                "[{tag}] note: remote rotation covers {remote_windows} x {max_size}-byte windows, \
+                 below depth {} - raise serve-urma --buf-len so concurrent ops do not hammer one remote range",
                 a.depth
             );
         }
         println!(
-            "[read-urma] bandwidth mode: depth {}, {} jetty(ies), post-list {}, cq-mod {}, landing {capped} bytes, remote rotation within the {}-byte peer segment",
+            "[{tag}] bandwidth mode: depth {}, {} jetty(ies), post-list {}, cq-mod {}, landing {capped} bytes, remote rotation within the {}-byte peer segment",
             a.depth,
             a.jetties,
             a.post_list,
@@ -647,27 +679,51 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
         max_size
     };
     println!(
-        "[4/4] register landing buffer ({landing_len} bytes), sweep {} sizes: {}",
+        "[4/4] register {} buffer ({landing_len} bytes), sweep {} sizes: {}",
+        if op == BwOp::Read { "landing" } else { "source" },
         sizes.len(),
         sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
     );
-    let landing = RegisteredBuf::new(&ctx, landing_len, TOKEN_VALUE)?;
+    let mut landing = RegisteredBuf::new(&ctx, landing_len, TOKEN_VALUE)?;
     let remote_va = wire.seg.va;
+    if op == BwOp::Write {
+        println!("[{tag}] note: WRITEs overwrite the peer's pattern - restart serve-urma before a read-urma verify against the same segment");
+    }
 
     let bwlabel = BwLabel { depth: a.depth, jetties: a.jetties, post_list: a.post_list };
-    print_header("urma", a.bench.iters, a.bench.warmup, &bwlabel, a.duration, a.bench.csv);
+    print_header("urma", op.label(), a.bench.iters, a.bench.warmup, &bwlabel, a.duration, a.bench.csv);
     for &size in &sizes {
-        let sge = landing.sge(0, size as u32)?;
-        /* verify pass outside the timed loop: one serialized READ, compare the
-           pattern — kept at depth 1 even in bandwidth mode (a correctness pass
-           must not overlap in-flight READs) */
-        jetty.post_read(peer, remote_va, &[sge], READ_CTX)?;
-        let _ = wait_read_spin(&cq)?;
-        check_pat(&format!("size {size} verify read"), &landing[..size])?;
+        /* verify pass outside the timed loop, one serialized op at a time —
+           kept at depth 1 even in bandwidth mode (a correctness pass must
+           not overlap in-flight ops). READ pulls the peer's pattern and
+           compares; WRITE pushes the pattern, then a READ-back compares:
+           zero the window first so the comparison can't pass on bytes the
+           source itself left behind (the sge borrows are kept inside each
+           post call — the fill needs the buffer exclusive) */
+        match op {
+            BwOp::Read => {
+                jetty.post_read(peer, remote_va, &[landing.sge(0, size as u32)?], READ_CTX)?;
+                let _ = wait_read_spin(&cq)?;
+                check_pat(&format!("size {size} verify read"), &landing[..size])?;
+            }
+            BwOp::Write => {
+                fill_pat(&mut landing[..size]);
+                jetty.post_write(peer, remote_va, &[landing.sge(0, size as u32)?], READ_CTX)?;
+                let _ = wait_read_spin(&cq)?;
+                landing[..size].fill(0);
+                jetty.post_read(peer, remote_va, &[landing.sge(0, size as u32)?], READ_CTX)?;
+                let _ = wait_read_spin(&cq)?;
+                check_pat(&format!("size {size} verify write read-back"), &landing[..size])?;
+            }
+        }
         if a.depth == 1 {
+            let sge = landing.sge(0, size as u32)?;
             let s = run_iters(
                 || {
-                    jetty.post_read(peer, remote_va, &[sge], READ_CTX)?;
+                    match op {
+                        BwOp::Read => jetty.post_read(peer, remote_va, &[sge], READ_CTX)?,
+                        BwOp::Write => jetty.post_write(peer, remote_va, &[sge], READ_CTX)?,
+                    }
                     wait_read_spin(&cq).map(|_| ())
                 },
                 a.bench.warmup,
@@ -684,6 +740,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
                 seg_len: wire.seg.len,
                 landing: &landing,
                 post_list: a.post_list,
+                op,
             };
             let s =
                 run_bw_iters(&bw, size, a.depth, m, a.bench.warmup, a.bench.iters, duration)?;
@@ -695,7 +752,7 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     } else {
         format!("{} iters", a.bench.iters)
     };
-    println!("[read-urma] done: {} sizes, {per} each", sizes.len());
+    println!("[{tag}] done: {} sizes, {per} each", sizes.len());
     Ok(())
 }
 
@@ -720,6 +777,35 @@ fn wait_read_spin(cq: &CompletionQueue) -> Result<Completion> {
 
 /* =========================== urma: read (bandwidth) ====================== */
 
+/// which one-sided op the sweep runs: READ pulls the peer's segment into
+/// the landing buffer, WRITE pushes the landing buffer (the source) into
+/// the peer's segment (perftest read_bw / write_bw). All the pipelining,
+/// moderation, fence and rotation mechanics are op-agnostic — only the
+/// work request itself differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BwOp {
+    Read,
+    Write,
+}
+
+impl BwOp {
+    /// subcommand-style log prefix
+    fn tag(&self) -> &'static str {
+        match self {
+            BwOp::Read => "read-urma",
+            BwOp::Write => "write-urma",
+        }
+    }
+
+    /// table/csv label
+    fn label(&self) -> &'static str {
+        match self {
+            BwOp::Read => "READ",
+            BwOp::Write => "WRITE",
+        }
+    }
+}
+
 /// the fixed parameters shared by the pipelined bandwidth passes
 struct BwCtx<'a> {
     /// one per --jetties, all sharing the one CQ; op i runs on
@@ -733,6 +819,8 @@ struct BwCtx<'a> {
     landing: &'a RegisteredBuf,
     /// READs chained per post call (--post-list)
     post_list: u32,
+    /// which one-sided op a pass posts
+    op: BwOp,
 }
 
 /// jetty of global op `i`: chunks of `list` consecutive ops per jetty,
@@ -784,11 +872,13 @@ impl BwStop {
 /// condition allows, reap completions in `BW_POLL_BATCH` batches as they
 /// land (each one frees slots for the next chunks). Ops carry
 /// `user_ctx = global op index`; with CQ moderation `cq_mod = m` only ops
-/// whose per-jetty rank is ≡ m-1 (mod m) are signaled, and a signaled READ
+/// whose per-jetty rank is ≡ m-1 (mod m) are signaled, and a signaled op
 /// carries comp_order, so a record proves every earlier op on THAT jetty
 /// completed — `done[j]` tracks it per jetty. A jetty whose stream stops on
 /// an unsignaled tail gets one extra 1-byte signaled fence READ
-/// (`BW_FENCE_CTX_BASE - j`) whose record closes it; fence bytes are not
+/// (`BW_FENCE_CTX_BASE - j`) whose record closes it — a READ also in WRITE
+/// mode: comp_order is a jfs-wide flag, so the fence's record covers the
+/// jetty's WRITE tail; fence bytes are not
 /// counted, so op/byte accounting is exact at any moderation and jetty
 /// count. A timed pass returns its whole first-post→last-completion window
 /// plus the completed-op count. Completions only need counting — no per-op
@@ -815,27 +905,42 @@ fn bw_pass(
                one jetty: a truncated previous chunk continues, not starts */
             let j = bw_op_jetty(next, n, list);
             let rem = (list - next % list) as usize;
-            let mut reqs = Vec::with_capacity(rem);
-            while reqs.len() < rem
+            let mut rreqs = Vec::with_capacity(rem);
+            let mut wreqs = Vec::with_capacity(rem);
+            while match bw.op {
+                BwOp::Read => rreqs.len(),
+                BwOp::Write => wreqs.len(),
+            } < rem
                 && !stop.stop_posting(next)
                 && next - done_total < u64::from(depth)
             {
                 let rank = bw_op_rank(next, n, list);
                 let off = bw_slot_off(next, size, bw.landing.len());
                 let va = bw.remote_va + bw_slot_off(next, size, bw.seg_len as usize) as u64;
-                reqs.push(ReadReq {
-                    remote_va: va,
-                    local: bw.landing.sge(off, size as u32)?,
-                    user_ctx: next,
-                    signaled: (rank + 1).is_multiple_of(cq_mod),
-                });
+                match bw.op {
+                    BwOp::Read => rreqs.push(ReadReq {
+                        remote_va: va,
+                        local: bw.landing.sge(off, size as u32)?,
+                        user_ctx: next,
+                        signaled: (rank + 1).is_multiple_of(cq_mod),
+                    }),
+                    BwOp::Write => wreqs.push(WriteReq {
+                        remote_va: va,
+                        local: bw.landing.sge(off, size as u32)?,
+                        user_ctx: next,
+                        signaled: (rank + 1).is_multiple_of(cq_mod),
+                    }),
+                }
                 if timed && next == 0 {
                     t0 = Some(Instant::now());
                 }
                 next += 1;
                 posted[j] += 1;
             }
-            bw.jetties[j].post_read_list(&bw.peers[j], &reqs)?;
+            match bw.op {
+                BwOp::Read => bw.jetties[j].post_read_list(&bw.peers[j], &rreqs)?,
+                BwOp::Write => bw.jetties[j].post_write_list(&bw.peers[j], &wreqs)?,
+            }
         }
         /* posting has stopped: once a queue slot frees up, fence every
            jetty that ended on an unsignaled tail, so the window can still
@@ -1063,6 +1168,7 @@ fn read_tcp_run(a: &ReadTcpArgs) -> Result<()> {
     let mut rbuf = vec![0u8; max_size];
     print_header(
         "tcp",
+        "READ",
         a.bench.iters,
         a.bench.warmup,
         &BwLabel { depth: 1, jetties: 1, post_list: 1 },
@@ -1271,7 +1377,7 @@ struct BwLabel {
 }
 
 fn print_header(
-    transport: &str, iters: u32, warmup: u32, bw: &BwLabel, duration: u64, csv: bool,
+    transport: &str, op: &str, iters: u32, warmup: u32, bw: &BwLabel, duration: u64, csv: bool,
 ) {
     if csv {
         if bw.depth > 1 {
@@ -1291,12 +1397,12 @@ fn print_header(
             String::new()
         };
         println!(
-            "== {transport} READ bandwidth: depth {}{parallel}, {mode} per size, MiB/s ==",
+            "== {transport} {op} bandwidth: depth {}{parallel}, {mode} per size, MiB/s ==",
             bw.depth
         );
         println!("{:>10} {:>7} {:>10} {:>10}", "size", "cq-mod", "avg", "Mops");
     } else {
-        println!("== {transport} READ latency: {iters} iters + {warmup} warmup per size, µs ==");
+        println!("== {transport} {op} latency: {iters} iters + {warmup} warmup per size, µs ==");
         println!("{:>10} {:>10} {:>10} {:>10} {:>10} {:>10}", "size", "min", "p50", "avg", "p99", "max");
     }
 }

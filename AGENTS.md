@@ -15,8 +15,9 @@ plus example demos.
   pure-URMA CLI, the single-file usage example of the whole API: `list
   [--caps]` probe plus `serve`/`read` manual copy-paste READ with
   `--mode`/`--tp` communication-mode selection — no HTTP control plane, no
-  tokio/serde, and deliberately no `common/mod.rs` include), `read_bench`
-  (READ-latency/bandwidth benchmark in the same pure-std style: URMA
+  tokio/serde, and deliberately no `common/mod.rs` include), `urma_bench`
+  (one-sided READ/WRITE latency-bandwidth benchmark in the same pure-std
+  style: URMA
   one-sided READ vs the TCP request/response emulation over a size sweep —
   `serve-urma`/`read-urma` + `serve-tcp`/`read-tcp`, per-size verify pass +
   warmup + timed iters, busy-poll of the CQ, never `wait_read`'s 100ms
@@ -46,7 +47,13 @@ plus example demos.
   seconds-long windows instead of `--iters` ops; `--priority` pins the
   jfs service-priority slot, defaulting to the device's slot for the
   selected `--tp` from its `priority_info` table — what urma_perftest
-  auto-picks for `-O` when omitted);
+  auto-picks for `-O` when omitted); `write-urma` runs the same sweep for
+  the opposite one-sided direction (perftest write_bw: lib
+  `Jetty::post_write[_signaled|_list]` + `WriteReq`, landing buffer as the
+  local source and the peer segment as destination, verify = one
+  serialized WRITE + READ-back — WRITEs overwrite the serve's pattern, so
+  restart serve-urma before a read-urma verify against the same segment;
+  sizes are capped by max_write_size AND max_read_size for that read-back);
   shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
@@ -62,7 +69,7 @@ cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
 cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
                             # targets are compiled but not run by plain
                             # `cargo test`)
-cargo test --example read_bench  # +11 (descriptor round-trip incl. multi-
+cargo test --example urma_bench  # +11 (descriptor round-trip incl. multi-
                             # rjetty, size-list parse x2, serve buf sizing +
                             # buf-len suffix parse, latency percentile stats,
                             # bandwidth stats math, slot cycling, cq-mod
@@ -72,12 +79,6 @@ cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
-./scripts/test_readbench.sh  # read_bench benchmark: TCP loopback always; with
-                            # UB_NODES also cross-node TCP + URMA READ matrix
-                            # (DEPTH/JETTYS/POSTLIST/DUR/CQMOD/LANDCAP knobs
-                            # pass --depth/--jettys/--post-list/--duration/
-                            # --cq-mod/--landing-cap: bandwidth mode + long
-                            # windows)
 ./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
                             # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),
                             # SKIPs when unset (UB has no loopback)
@@ -132,7 +133,7 @@ cargo clippy --examples
   `priority_for(tp)` resolves the jfs priority slot the device's
   `priority_info` table assigns a tp type — the slot urma_perftest
   auto-picks for `-O`; `JettyOpts::priority`, default
-  `URMA_MAX_PRIORITY`, carries it into `urma_create_jetty`, and read_bench
+  `URMA_MAX_PRIORITY`, carries it into `urma_create_jetty`, and urma_bench
   defaults it to that slot via `--priority`). All
   real-device example runs preflight their mode (CTP-RM + RM multi-path on
   bonding) via `common::check_mode_support` before creating any resource —

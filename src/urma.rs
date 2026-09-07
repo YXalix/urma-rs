@@ -1002,6 +1002,132 @@ impl Jetty {
         )
     }
 
+    /// Post one one-sided WRITE: the local sge list -> the contiguous remote
+    /// range at `remote_va` on the peer's registered segment. WRITE has the
+    /// same one-sidedness as READ in the opposite direction: the initiator's
+    /// completion record lands when the data is placed remotely, and the
+    /// peer's CPU is never involved. Direction in `urma_rw_wr_t` follows the
+    /// data: src is the LOCAL source, dst the REMOTE destination (urma_sample
+    /// writes with this layout and reads back with the pair swapped).
+    pub fn post_write(
+        &self,
+        peer: &Peer,
+        remote_va: u64,
+        local: &[LocalSge],
+        user_ctx: u64,
+    ) -> Result<()> {
+        self.post_write_signaled(peer, remote_va, local, user_ctx, true)
+    }
+
+    /// [`Jetty::post_write`] with control over the completion record:
+    /// `signaled = false` clears `URMA_JFS_WR_FLAG_COMPLETE_ENABLE`, the
+    /// WRITE-side CQ moderation for a bandwidth loop. `comp_order` is a
+    /// per-jfs flag, not a READ one, so a signaled WRITE's record equally
+    /// proves every earlier op on the jetty — including unsignaled ones —
+    /// has completed.
+    pub fn post_write_signaled(
+        &self,
+        peer: &Peer,
+        remote_va: u64,
+        local: &[LocalSge],
+        user_ctx: u64,
+        signaled: bool,
+    ) -> Result<()> {
+        let mut local_sges = self.check_local(local)?;
+        let total = local
+            .iter()
+            .try_fold(0u32, |a, s| a.checked_add(s.len))
+            .ok_or_else(|| Error::Invalid("total local sge length overflows u32".into()))?;
+        let mut remote_sge = ffi::urma_sge_t {
+            addr: remote_va,
+            len: total,
+            tseg: peer.tseg.as_ptr(),
+            ..Default::default()
+        };
+        let remote_sg = ffi::urma_sg_t { sge: &mut remote_sge, num_sge: 1 };
+        let local_sg =
+            ffi::urma_sg_t { sge: local_sges.as_mut_ptr(), num_sge: local_sges.len() as u32 };
+        let rw = ffi::urma_rw_wr_t { src: local_sg, dst: remote_sg, ..Default::default() };
+
+        let mut wr = ffi::urma_jfs_wr_t {
+            opcode: ffi::URMA_OPC_WRITE,
+            flag: ffi::urma_jfs_wr_flag_t {
+                value: if signaled {
+                    ffi::URMA_JFS_WR_FLAG_COMPLETE_ENABLE | ffi::URMA_JFS_WR_FLAG_COMP_ORDER
+                } else {
+                    0
+                },
+            },
+            tjetty: peer.tjetty.as_ptr(),
+            user_ctx,
+            rw,
+            ..Default::default()
+        };
+
+        let mut bad_wr: *mut ffi::urma_jfs_wr_t = std::ptr::null_mut();
+        check_status(
+            unsafe { ffi::urma_post_jetty_send_wr(self.raw.as_ptr(), &mut wr, &mut bad_wr) },
+            "urma_post_jetty_send_wr(WRITE)",
+        )
+    }
+
+    /// Post a batch of one-sided WRITEs as ONE linked work-request list —
+    /// [`Jetty::post_read_list`]'s batching for the WRITE direction. Each
+    /// entry has the semantics of [`Jetty::post_write_signaled`] with
+    /// exactly one local sge.
+    pub fn post_write_list(&self, peer: &Peer, reqs: &[WriteReq<'_>]) -> Result<()> {
+        if reqs.is_empty() {
+            return Err(Error::Invalid("empty WRITE list".into()));
+        }
+        /* materialized only once len is final, then wired through raw
+           pointers (a next chain aliases the vec's own elements) */
+        let mut remote_sges = Vec::with_capacity(reqs.len());
+        let mut local_sges = Vec::with_capacity(reqs.len());
+        let mut wrs: Vec<ffi::urma_jfs_wr_t> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            remote_sges.push(ffi::urma_sge_t {
+                addr: r.remote_va,
+                len: r.local.len,
+                tseg: peer.tseg.as_ptr(),
+                ..Default::default()
+            });
+            local_sges.push(r.local.to_ffi());
+            wrs.push(ffi::urma_jfs_wr_t {
+                opcode: ffi::URMA_OPC_WRITE,
+                flag: ffi::urma_jfs_wr_flag_t {
+                    value: if r.signaled {
+                        ffi::URMA_JFS_WR_FLAG_COMPLETE_ENABLE | ffi::URMA_JFS_WR_FLAG_COMP_ORDER
+                    } else {
+                        0
+                    },
+                },
+                tjetty: peer.tjetty.as_ptr(),
+                user_ctx: r.user_ctx,
+                rw: ffi::urma_rw_wr_t::default(),
+                next: std::ptr::null_mut(),
+            });
+        }
+        let (rbase, lbase, wbase) =
+            (remote_sges.as_mut_ptr(), local_sges.as_mut_ptr(), wrs.as_mut_ptr());
+        for i in 0..wrs.len() {
+            unsafe {
+                (*wbase.add(i)).rw = ffi::urma_rw_wr_t {
+                    src: ffi::urma_sg_t { sge: lbase.add(i), num_sge: 1 },
+                    dst: ffi::urma_sg_t { sge: rbase.add(i), num_sge: 1 },
+                    ..Default::default()
+                };
+                if i + 1 < wrs.len() {
+                    (*wbase.add(i)).next = wbase.add(i + 1);
+                }
+            }
+        }
+        let mut bad_wr: *mut ffi::urma_jfs_wr_t = std::ptr::null_mut();
+        check_status(
+            unsafe { ffi::urma_post_jetty_send_wr(self.raw.as_ptr(), &mut wrs[0], &mut bad_wr) },
+            "urma_post_jetty_send_wr(WRITE list)",
+        )
+    }
+
     /// Post one two-sided SEND: send the local sge list (gather) to `peer`'s
     /// receive buffer (posted beforehand via [`Jetty::post_recv`]). Both sides
     /// get a completion record: local send completion means "data consumed by
@@ -1451,6 +1577,21 @@ pub struct ReadReq<'a> {
     /// contiguous remote range start (on the peer's registered segment)
     pub remote_va: u64,
     /// local landing window (one sge)
+    pub local: LocalSge<'a>,
+    /// completion tag, returned in the completion record of signaled entries
+    pub user_ctx: u64,
+    /// whether this entry generates a completion record
+    pub signaled: bool,
+}
+
+/// One entry of a [`Jetty::post_write_list`] batch: a one-sided WRITE with
+/// exactly one local sge (the SOURCE; the remote range is the destination),
+/// the `signaled` semantics of [`Jetty::post_write_signaled`]
+#[derive(Clone, Copy)]
+pub struct WriteReq<'a> {
+    /// contiguous remote range start (the destination, on the peer's segment)
+    pub remote_va: u64,
+    /// local source window (one sge)
     pub local: LocalSge<'a>,
     /// completion tag, returned in the completion record of signaled entries
     pub user_ctx: u64,

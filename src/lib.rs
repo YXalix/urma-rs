@@ -20,6 +20,6 @@ pub use ffi::URMA_MAX_PRIORITY;
 pub use urma::{
     list_devices, query_device, Completion, CompletionQueue, Context, DeviceCap, Eid, Jetty,
     JettyId, JettyOpts, LocalSge, OrderTypeCap, PageBuf, Peer, ReadReq, RegisteredBuf,
-    RegisteredSeg, SegDesc, TpType, TpTypeCap, TransMode, Urma, DEFAULT_DEPTH, PAGE_SIZE,
-    POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE,
+    RegisteredSeg, SegDesc, TpType, TpTypeCap, TransMode, Urma, WriteReq, DEFAULT_DEPTH,
+    PAGE_SIZE, POLL_INTERVAL, POLL_RETRIES, TOKEN_VALUE,
 };

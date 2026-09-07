@@ -67,8 +67,10 @@ enum Cmd {
                       combos : the (mode, tp) pairs usable as serve/read --mode/--tp values\n  \
                       (CTP additionally requires the device-level ctp_en gate)\n  \
                       limits : max_jfs_sge/max_jfr_sge = scatter-gather entries per\n  \
-                      send/recv, max_msg_size = largest single message in bytes,\n  \
-                      page_size_cap = page-size bitmap for pinned registration"
+                      send/recv, max_msg_size = largest two-sided message in bytes,\n  \
+                      max_read_size/max_write_size = largest one one-sided READ/WRITE\n  \
+                      (0 = not reported), page_size_cap = page-size bitmap for pinned\n  \
+                      registration"
     )]
     List {
         #[arg(long)]
@@ -196,8 +198,9 @@ fn list_run(caps: bool) -> Result<()> {
                             .join(" ")
                     );
                     println!(
-                        "  limits : max_jfs_sge {} max_jfr_sge {} max_msg_size {} page_size_cap {:#x}",
-                        cap.max_jfs_sge, cap.max_jfr_sge, cap.max_msg_size, cap.page_size_cap
+                        "  limits : max_jfs_sge {} max_jfr_sge {} max_msg_size {} max_read_size {} max_write_size {} page_size_cap {:#x}",
+                        cap.max_jfs_sge, cap.max_jfr_sge, cap.max_msg_size, cap.max_read_size,
+                        cap.max_write_size, cap.page_size_cap
                     );
                 }
                 Err(e) => eprintln!("  query failed: {e}"),
@@ -208,8 +211,8 @@ fn list_run(caps: bool) -> Result<()> {
         println!(
             "  (legend: modes = transport modes RM/RC/UM with their usable tp types; an
    empty tp= means the mode is advertised but unusable here; combos = the valid
-   --mode/--tp pairs; limits = per-send/recv sge, message-size and page-size
-   ceilings. Background: docs/urma.md)"
+   --mode/--tp pairs; limits = per-send/recv sge, message/READ/WRITE size and
+   page-size ceilings. Background: docs/urma.md)"
         );
     }
     Ok(())

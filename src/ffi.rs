@@ -977,6 +977,8 @@ mod tests {
         // urma_device_cap_t: u64 fields force the padding at 52..56 and
         // 124..128; the per-mode caps sit behind the scalar tail
         assert_eq!(offset_of!(urma_device_cap_t, max_msg_size), 56);
+        assert_eq!(offset_of!(urma_device_cap_t, max_read_size), 64);
+        assert_eq!(offset_of!(urma_device_cap_t, max_write_size), 68);
         assert_eq!(offset_of!(urma_device_cap_t, trans_mode), 104);
         assert_eq!(offset_of!(urma_device_cap_t, page_size_cap), 128);
         assert_eq!(offset_of!(urma_device_cap_t, rm_order_cap), 148);

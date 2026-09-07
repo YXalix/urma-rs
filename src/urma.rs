@@ -321,8 +321,12 @@ pub struct DeviceCap {
     /// [`JettyOpts::max_sge`])
     pub max_jfs_sge: u32,
     pub max_jfr_sge: u32,
-    /// Max message size in bytes
+    /// Max message size in bytes (two-sided SEND/RECV messages)
     pub max_msg_size: u64,
+    /// Max bytes of one one-sided READ (0 = not reported by the provider)
+    pub max_read_size: u64,
+    /// Max bytes of one one-sided WRITE (0 = not reported by the provider)
+    pub max_write_size: u64,
     /// Supported page sizes as a bitmap (must include 4K, see [`PAGE_SIZE`])
     pub page_size_cap: u64,
 }
@@ -364,6 +368,8 @@ impl DeviceCap {
             max_jfs_sge: cap.max_jfs_sge,
             max_jfr_sge: cap.max_jfr_sge,
             max_msg_size: cap.max_msg_size,
+            max_read_size: cap.max_read_size as u64,
+            max_write_size: cap.max_write_size as u64,
             page_size_cap: cap.page_size_cap,
         }
     }
@@ -1337,5 +1343,16 @@ mod tests {
         let cap = DeviceCap::from_raw(&raw);
         assert!(!cap.supports(TransMode::Um, TpType::Utp));
         assert!(!cap.supports_mode(TransMode::Rc));
+
+        /* size ceilings travel through from_raw verbatim (max_read_size /
+           max_write_size bound one-sided ops; max_msg_size bounds messages) */
+        raw.max_msg_size = 65536;
+        raw.max_read_size = 1048576;
+        raw.max_write_size = 2097152;
+        let cap = DeviceCap::from_raw(&raw);
+        assert_eq!(
+            (cap.max_msg_size, cap.max_read_size, cap.max_write_size),
+            (65536, 1048576, 2097152)
+        );
     }
 }

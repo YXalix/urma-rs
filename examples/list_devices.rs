@@ -18,8 +18,10 @@
 //!   device-level ctp_en gate) — the answer to "which communication modes
 //!   does this device support"
 //! - `limits` : max_jfs_sge/max_jfr_sge = scatter-gather entries per
-//!   send/recv, max_msg_size = largest single message in bytes,
-//!   page_size_cap = page-size bitmap for pinned registration
+//!   send/recv, max_msg_size = largest two-sided message in bytes,
+//!   max_read_size/max_write_size = largest one one-sided READ/WRITE
+//!   (0 = not reported), page_size_cap = page-size bitmap for pinned
+//!   registration
 //!
 //! A legend trailer is printed after the listing; full background in
 //! `docs/urma.md`. Exit code: 0 = at least one device, 1 = no device or
@@ -46,8 +48,9 @@ fn main() {
                                     .join(" ")
                             );
                             println!(
-                                "  limits       : max_jfs_sge {} max_jfr_sge {} max_msg_size {} page_size_cap {:#x}",
-                                cap.max_jfs_sge, cap.max_jfr_sge, cap.max_msg_size, cap.page_size_cap
+                                "  limits       : max_jfs_sge {} max_jfr_sge {} max_msg_size {} max_read_size {} max_write_size {} page_size_cap {:#x}",
+                                cap.max_jfs_sge, cap.max_jfr_sge, cap.max_msg_size,
+                                cap.max_read_size, cap.max_write_size, cap.page_size_cap
                             );
                         }
                 Err(e) => eprintln!("  query failed: {e}"),
@@ -58,8 +61,8 @@ fn main() {
         println!(
             "  (legend: modes = transport modes RM/RC/UM with their usable tp types; an
    empty tp= means the mode is advertised but unusable here; combos = the usable
-   mode-tp combinations; limits = per-send/recv sge, message-size and page-size
-   ceilings. Background: docs/urma.md)"
+   mode-tp combinations; limits = per-send/recv sge, message/READ/WRITE size
+   and page-size ceilings. Background: docs/urma.md)"
         );
     }
 }

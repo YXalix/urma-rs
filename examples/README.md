@@ -75,7 +75,8 @@ cargo run --example list_devices -- --caps   # + per-device supported-mode matri
 #   bonding_dev_0
 #     modes  : RM[tp=RTP,CTP order=oi multi-path] RC[tp=] UM[tp=]
 #     combos : RM-RTP RM-CTP
-#     limits : max_jfs_sge 13 max_jfr_sge 4 max_msg_size 65536 page_size_cap 0x0
+#     limits : max_jfs_sge 13 max_jfr_sge 4 max_msg_size 65536 max_read_size 1048576
+#              max_write_size 1048576 page_size_cap 0x0
 #   (legend: modes = transport modes RM/RC/UM with their usable tp types; ...)
 
 # on both nodes, each pointing at the other's IP:
@@ -97,9 +98,10 @@ mode is effectively unavailable. `combos` is the flattened answer: every
 (mode, tp) pair you may actually use (CTP additionally requires the
 device-level `ctp_en` gate) — the valid `--mode`/`--tp` values for the demos.
 `limits` caps a workload: `max_jfs_sge`/`max_jfr_sge` scatter-gather entries
-per send/recv, `max_msg_size` largest single message in bytes,
-`page_size_cap` page-size bitmap for pinned registration (0 = not reported by
-the provider). The concepts behind the three knobs are in `docs/urma.md`.
+per send/recv, `max_msg_size` largest two-sided message in bytes, `max_read_size` /
+`max_write_size` largest one one-sided READ / WRITE in bytes (0 = not
+reported by the provider), `page_size_cap` page-size bitmap for pinned
+registration. The concepts behind these knobs are in `docs/urma.md`.
 
 Before creating any resource, every real-device run also preflights the
 fixed CTP-RM mode against these capabilities
@@ -132,20 +134,26 @@ request/response emulation (4-byte length request → N-byte response, one
 RTT per op, TCP_NODELAY forced); URMA measures the real one-sided READ
 (post + busy-polled completion, the server CPU never touched). Both sides
 share the sweep/verify/warmup discipline so the columns are comparable,
-and sizes above `max_msg_size`/the registered segment are skipped with a
-note. Run it between the same pair of machines:
+and sizes above the device's READ ceiling (`max_read_size`, falling
+back to `max_msg_size` when unreported) or above the registered segment
+are skipped with a note. Run it between the same pair of machines:
 
 ```bash
 # TCP reference over the IP fabric:
 nodeA$ cargo run --example read_lat -- serve-tcp
 nodeB$ cargo run --example read_lat -- read-tcp --addr <ipA>
 
-# URMA over the UB fabric (descriptor by copy-paste, like urma_cli):
-nodeA$ cargo run --example read_lat -- serve-urma -d bonding_dev_0
-nodeB$ cargo run --example read_lat -- read-urma -d bonding_dev_0 '<the [desc] hex line>'
+# URMA over the UB fabric (descriptor by copy-paste, like urma_cli);
+# serve sizes its segment to the sweep's maximum, so the sides cannot drift:
+nodeA$ cargo run --example read_lat -- serve-urma -d bonding_dev_0 --sizes 8..16m
+nodeB$ cargo run --example read_lat -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
+        --sizes 8..16m
 ```
 
-`--sizes 8,64,...`, `--iters`, `--warmup`, `--csv` control the sweep;
+`--sizes` (comma list `8,64,1k` or doubling range `8..16m`, k/m/g
+suffixes allowed), `--iters`, `--warmup`, `--csv` control the sweep —
+the serve subcommands accept `--sizes` too and size their buffer to its
+maximum, so no manual `--buf-len` bookkeeping is needed;
 `scripts/test_readlat.sh` runs the whole matrix (local TCP loopback
 always, both transports across a `UB_NODES` pair) and prints the two
 tables side by side.

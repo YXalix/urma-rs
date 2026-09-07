@@ -14,8 +14,9 @@
 #
 # Node list: UB_NODES="ipA ipB" or scripts/ub_nodes.txt (see test_ub.sh).
 # Env knobs (passed to both sides):
-#   SIZES / ITERS / WARMUP  benchmark knobs (default: read_lat's own)
-#   BUFLEN                  serve-side buffer bytes (default: max SIZES, or 1M)
+#   SIZES / ITERS / WARMUP  benchmark knobs, passed to readers AND serves
+#                           (SIZES also sizes the serve-side buffer to its max)
+#   BUFLEN                  explicit serve-side buffer bytes (rarely needed)
 #   PORT                    TCP port (default 13860)
 #   DEV / DEV_A / DEV_B     URMA device per node (default: probe via
 #                           list_devices; URMA part is skipped when absent)
@@ -34,11 +35,9 @@ PORT=${PORT:-13860}
 TMO=${TMO:-120}
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
 
-if [ -n "${SIZES:-}" ]; then
-    BUFLEN=${BUFLEN:-$(echo "$SIZES" | tr ',' '\n' | sort -n | tail -1)}
-else
-    BUFLEN=${BUFLEN:-1048576}
-fi
+SRV=()
+[ -n "${SIZES:-}" ]   && SRV+=(--sizes "$SIZES")
+[ -n "${BUFLEN:-}" ] && SRV+=(--buf-len "$BUFLEN")
 
 FAIL=0
 
@@ -54,7 +53,7 @@ wait_for_line() { # <logfile> <fixed string> <max-seconds>
 # --- 1) local TCP loopback (no device needed) --------------------------------
 echo "== read_lat: tcp loopback (127.0.0.1) =="
 LOG=$(mktemp /tmp/read_lat.local.XXXXXX.log)
-"$BIN" serve-tcp --port "$PORT" --buf-len "$BUFLEN" >/dev/null 2>&1 &
+"$BIN" serve-tcp --port "$PORT" "${SRV[@]}" >/dev/null 2>&1 &
 SRV=$!
 "$BIN" read-tcp --addr 127.0.0.1 --port "$PORT" "${BENCH[@]}" | tee "$LOG"
 kill "$SRV" 2>/dev/null
@@ -118,7 +117,7 @@ run_node() {  # <node> <rdir> <logfile> <cmd...>
 
 # --- 2a) TCP across the nodes -------------------------------------------------
 echo "== read_lat: tcp across nodes ($B -> $IP_A) =="
-run_node "$A" "$RDIR_A" tcp.serve.log read_lat serve-tcp --port "$PORT" --buf-len "$BUFLEN" &
+run_node "$A" "$RDIR_A" tcp.serve.log read_lat serve-tcp --port "$PORT" "${SRV[@]}" &
 PA=$!
 if wait_for_line "$LOGDIR/tcp.serve.log" "listening on" 15; then
     run_node "$B" "$RDIR_B" tcp.read.log read_lat read-tcp --addr "$IP_A" --port "$PORT" "${BENCH[@]}"
@@ -140,7 +139,7 @@ DEV_B=${DEV_B:-${DEV:-$(probe_dev "$B" "$RDIR_B")}}
 
 if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
     echo "== read_lat: urma across nodes ($B reads $A; devices $DEV_A / $DEV_B) =="
-    run_node "$A" "$RDIR_A" urma.serve.log read_lat serve-urma -d "$DEV_A" --buf-len "$BUFLEN" &
+    run_node "$A" "$RDIR_A" urma.serve.log read_lat serve-urma -d "$DEV_A" "${SRV[@]}" &
     PS=$!
     # serve-urma prints the descriptor as one hex line once its resources are
     # up; play the human: grab it from the log and pass it to nodeB's reader

@@ -22,8 +22,9 @@
 //!
 //! ```bash
 //! # URMA READ latency between two nodes:
-//! nodeA$ cargo run --example read_lat -- serve-urma -d bonding_dev_0
-//! nodeB$ cargo run --example read_lat -- read-urma -d bonding_dev_0 '<[desc] hex>'
+//! nodeA$ cargo run --example read_lat -- serve-urma -d bonding_dev_0 --sizes 8..16m
+//! nodeB$ cargo run --example read_lat -- read-urma -d bonding_dev_0 '<[desc] hex>' \
+//!         --sizes 8..16m   # serve sizes its buffer to the sweep's maximum
 //!
 //! # TCP reference over the same pair of machines:
 //! nodeA$ cargo run --example read_lat -- serve-tcp
@@ -106,7 +107,8 @@ struct ModeArgs {
 /// benchmark knobs shared by read-urma/read-tcp
 #[derive(Args)]
 struct BenchArgs {
-    /// comma-separated read sizes in bytes (deduped, swept ascending)
+    /// read sizes: comma list (8,64,1k) or doubling range first..last (8..16m);
+    /// k/m/g suffixes allowed, deduped, swept ascending
     #[arg(long, default_value = DEFAULT_SIZES)]
     sizes: String,
     /// timed iterations per size
@@ -124,9 +126,12 @@ struct BenchArgs {
 struct ServeUrmaArgs {
     #[command(flatten)]
     mode: ModeArgs,
-    /// registered buffer size in bytes (must cover the largest size the reader sweeps)
-    #[arg(long, default_value_t = DEFAULT_BUF_LEN)]
-    buf_len: usize,
+    /// size sweep the reader will run; the segment is sized to its maximum
+    #[arg(long)]
+    sizes: Option<String>,
+    /// explicit buffer size in bytes (overrides --sizes-derived sizing)
+    #[arg(long)]
+    buf_len: Option<usize>,
 }
 
 #[derive(Args)]
@@ -147,9 +152,12 @@ struct ServeTcpArgs {
     /// listen port
     #[arg(short, long, default_value_t = 13860)]
     port: u16,
-    /// response buffer size in bytes (must cover the largest size the client sweeps)
-    #[arg(long, default_value_t = DEFAULT_BUF_LEN)]
-    buf_len: usize,
+    /// size sweep the client will run; the buffer is sized to its maximum
+    #[arg(long)]
+    sizes: Option<String>,
+    /// explicit buffer size in bytes (overrides --sizes-derived sizing)
+    #[arg(long)]
+    buf_len: Option<usize>,
 }
 
 #[derive(Args)]
@@ -219,6 +227,7 @@ fn main() -> ExitCode {
 
 fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
     let (mode, _tp, multi_path, _) = preflight(&a.mode)?;
+    let buf_len = resolve_buf_len(a.buf_len, a.sizes.as_deref())?;
 
     println!("[1/5] urma init + context on {}", a.mode.dev);
     let urma = Urma::init()?;
@@ -231,8 +240,8 @@ fn serve_urma_run(a: &ServeUrmaArgs) -> Result<()> {
         Jetty::new(&ctx, &cq, JettyOpts { trans_mode: mode, multi_path, ..Default::default() })?;
     println!("      jetty id {} uasid {:#x}", jetty.id().id, jetty.id().uasid);
 
-    println!("[3/5] register {}-byte segment, fill read pattern", a.buf_len);
-    let mut buf = RegisteredBuf::new(&ctx, a.buf_len, TOKEN_VALUE)?;
+    println!("[3/5] register {buf_len}-byte segment, fill read pattern");
+    let mut buf = RegisteredBuf::new(&ctx, buf_len, TOKEN_VALUE)?;
     fill_pat(&mut buf[..]);
     let seg = buf.descriptor();
     println!(
@@ -284,16 +293,25 @@ fn read_urma_run(a: &ReadUrmaArgs) -> Result<()> {
     );
 
     let (mode, tp, multi_path, cap) = preflight(&a.mode)?;
-    /* sizes above either ceiling are skipped with a note, not fatal: one sweep
-       then works on any device (max_msg_size 0 = not reported by the provider) */
-    let dev_max = if cap.max_msg_size == 0 { u64::MAX } else { cap.max_msg_size };
-    let limit = dev_max.min(wire.seg.len);
+    /* sizes above the READ ceiling are skipped with a note, not fatal: one
+       sweep then works on any device. A one-sided READ is bounded by the
+       device's max_read_size — max_msg_size caps two-sided messages, not
+       READs (urma_device_cap_t carries both); 0 = not reported, then fall
+       back to max_msg_size, then to no limit */
+    let read_cap = if cap.max_read_size != 0 {
+        cap.max_read_size
+    } else if cap.max_msg_size != 0 {
+        cap.max_msg_size
+    } else {
+        u64::MAX
+    };
+    let limit = read_cap.min(wire.seg.len);
     sizes.retain(|&s| {
         let ok = (s as u64) <= limit;
         if !ok {
             println!(
-                "[read-urma] skip size {s}: above the {limit}-byte ceiling (peer segment {}, device max_msg_size {})",
-                wire.seg.len, cap.max_msg_size
+                "[read-urma] skip size {s}: above the {limit}-byte READ ceiling (peer segment {}, device max_read_size {} / max_msg_size {})",
+                wire.seg.len, cap.max_read_size, cap.max_msg_size
             );
         }
         ok
@@ -428,13 +446,13 @@ fn preflight(m: &ModeArgs) -> Result<(TransMode, TpType, bool, DeviceCap)> {
 /* ============================== tcp: serve =============================== */
 
 fn serve_tcp_run(a: &ServeTcpArgs) -> Result<()> {
-    let mut buf = vec![0u8; a.buf_len];
+    let buf_len = resolve_buf_len(a.buf_len, a.sizes.as_deref())?;
+    let mut buf = vec![0u8; buf_len];
     fill_pat(&mut buf);
     let listener = TcpListener::bind((a.addr.as_str(), a.port))?;
     println!(
-        "[serve-tcp] listening on {} ({}-byte pattern buffer, serves until killed)",
+        "[serve-tcp] listening on {} ({buf_len}-byte pattern buffer, serves until killed)",
         listener.local_addr()?,
-        a.buf_len
     );
     println!("[serve-tcp] one op = 4-byte LE length request -> that many bytes back");
     loop {
@@ -527,22 +545,34 @@ fn bench_sizes(b: &BenchArgs) -> Result<Vec<usize>> {
 }
 
 fn parse_sizes(spec: &str) -> Result<Vec<usize>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(Error::Invalid("--sizes is empty".into()));
+    }
+    /* "first..last" = doubling sweep, both ends inclusive: 8..16m gives
+       8,16,...,16M (the last step is the largest doubling that still fits);
+       anything else is a comma list */
+    if let Some((first, last)) = spec.split_once("..") {
+        let first = parse_one_size(first)?;
+        let last = parse_one_size(last)?;
+        if last < first {
+            return Err(Error::Invalid(format!("empty size range {first}..{last}")));
+        }
+        let mut sizes = vec![first];
+        while let Some(next) = sizes.last().unwrap().checked_mul(2) {
+            if next > last {
+                break;
+            }
+            sizes.push(next);
+        }
+        return Ok(sizes);
+    }
     let mut sizes = Vec::new();
     for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+        if part.trim().is_empty() {
             continue;
         }
-        let n: usize = part
-            .parse()
-            .map_err(|_| Error::Invalid(format!("bad size '{part}' in --sizes")))?;
-        if n == 0 {
-            return Err(Error::Invalid("--sizes contains 0".into()));
-        }
-        if n > u32::MAX as usize {
-            return Err(Error::Invalid(format!("size {n} exceeds the u32 sge length limit")));
-        }
-        sizes.push(n);
+        sizes.push(parse_one_size(part)?);
     }
     if sizes.is_empty() {
         return Err(Error::Invalid("--sizes is empty".into()));
@@ -550,6 +580,43 @@ fn parse_sizes(spec: &str) -> Result<Vec<usize>> {
     sizes.sort_unstable();
     sizes.dedup();
     Ok(sizes)
+}
+
+/// one size token: plain bytes ("4096") or with a binary suffix ("4k"/"1m"/"2g",
+/// case-insensitive); 0 and anything above the u32 sge length limit rejected
+fn parse_one_size(tok: &str) -> Result<usize> {
+    let tok = tok.trim();
+    let (num, mult) = match tok.as_bytes().last() {
+        Some(b'k' | b'K') => (&tok[..tok.len() - 1], 1 << 10),
+        Some(b'm' | b'M') => (&tok[..tok.len() - 1], 1 << 20),
+        Some(b'g' | b'G') => (&tok[..tok.len() - 1], 1 << 30),
+        _ => (tok, 1),
+    };
+    let n: usize =
+        num.parse().map_err(|_| Error::Invalid(format!("bad size '{tok}' in --sizes")))?;
+    let n = n.checked_mul(mult).ok_or_else(|| Error::Invalid(format!("size '{tok}' overflows")))?;
+    if n == 0 {
+        return Err(Error::Invalid("--sizes contains 0".into()));
+    }
+    if n > u32::MAX as usize {
+        return Err(Error::Invalid(format!("size {n} exceeds the u32 sge length limit")));
+    }
+    Ok(n)
+}
+
+/// serve-side buffer size: explicit --buf-len wins, else the max of --sizes
+/// (when the sweep is declared), else DEFAULT_BUF_LEN
+fn resolve_buf_len(buf_len: Option<usize>, sizes: Option<&str>) -> Result<usize> {
+    if let Some(n) = buf_len {
+        if n == 0 {
+            return Err(Error::Invalid("--buf-len must be at least 1".into()));
+        }
+        return Ok(n);
+    }
+    if let Some(spec) = sizes {
+        return Ok(*parse_sizes(spec)?.last().unwrap());
+    }
+    Ok(DEFAULT_BUF_LEN)
 }
 
 /// run `op` warmup+iters times, timing only the last `iters` calls
@@ -788,6 +855,32 @@ mod tests {
         assert!(parse_sizes("8,x").is_err());
         assert!(parse_sizes("0").is_err());
         assert!(parse_sizes("8,4294967296").is_err()); /* above the u32 sge limit */
+    }
+
+    #[test]
+    fn sizes_range_and_suffixes() {
+        assert_eq!(parse_sizes("8..32").unwrap(), vec![8, 16, 32]);
+        assert_eq!(parse_sizes("4k..16K").unwrap(), vec![4096, 8192, 16384]);
+        assert_eq!(parse_sizes("8..1000").unwrap(), vec![8, 16, 32, 64, 128, 256, 512]);
+        let m = parse_sizes("8..16m").unwrap();
+        assert_eq!((*m.first().unwrap(), *m.last().unwrap()), (8, 16 << 20));
+        assert!(m.iter().zip(m.iter().skip(1)).all(|(a, b)| b == &(a * 2)));
+        assert_eq!(parse_sizes("1k,2K,1m,1M").unwrap(), vec![1024, 2048, 1048576]);
+        assert!(parse_sizes("8..4").is_err()); /* empty range */
+        assert!(parse_sizes("0..8").is_err());
+        assert!(parse_sizes("8..").is_err());
+        assert!(parse_sizes("1x").is_err());
+        assert!(parse_sizes("8..16,32").is_err()); /* a range is never a list */
+    }
+
+    #[test]
+    fn serve_buf_len_resolution() {
+        assert_eq!(resolve_buf_len(None, None).unwrap(), DEFAULT_BUF_LEN);
+        assert_eq!(resolve_buf_len(Some(123), Some("8..16m")).unwrap(), 123); /* explicit wins */
+        assert_eq!(resolve_buf_len(None, Some("8..16m")).unwrap(), 16 << 20);
+        assert_eq!(resolve_buf_len(None, Some("1k,2m")).unwrap(), 2 << 20);
+        assert!(resolve_buf_len(Some(0), None).is_err());
+        assert!(resolve_buf_len(None, Some("junk")).is_err());
     }
 
     #[test]

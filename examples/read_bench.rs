@@ -168,8 +168,9 @@ struct ServeUrmaArgs {
     /// size sweep the reader will run; the segment is sized to its maximum
     #[arg(long)]
     sizes: Option<String>,
-    /// explicit buffer size in bytes (overrides --sizes-derived sizing)
-    #[arg(long)]
+    /// explicit buffer size (plain bytes or k/m/g suffixes, e.g. 512m;
+    /// overrides --sizes-derived sizing)
+    #[arg(long, value_parser = parse_buf_len)]
     buf_len: Option<usize>,
 }
 
@@ -205,8 +206,9 @@ struct ServeTcpArgs {
     /// size sweep the client will run; the buffer is sized to its maximum
     #[arg(long)]
     sizes: Option<String>,
-    /// explicit buffer size in bytes (overrides --sizes-derived sizing)
-    #[arg(long)]
+    /// explicit buffer size (plain bytes or k/m/g suffixes, e.g. 512m;
+    /// overrides --sizes-derived sizing)
+    #[arg(long, value_parser = parse_buf_len)]
     buf_len: Option<usize>,
 }
 
@@ -770,8 +772,8 @@ fn parse_sizes(spec: &str) -> Result<Vec<usize>> {
        8,16,...,16M (the last step is the largest doubling that still fits);
        anything else is a comma list */
     if let Some((first, last)) = spec.split_once("..") {
-        let first = parse_one_size(first)?;
-        let last = parse_one_size(last)?;
+        let first = parse_one_size(first, "--sizes")?;
+        let last = parse_one_size(last, "--sizes")?;
         if last < first {
             return Err(Error::Invalid(format!("empty size range {first}..{last}")));
         }
@@ -789,7 +791,7 @@ fn parse_sizes(spec: &str) -> Result<Vec<usize>> {
         if part.trim().is_empty() {
             continue;
         }
-        sizes.push(parse_one_size(part)?);
+        sizes.push(parse_one_size(part, "--sizes")?);
     }
     if sizes.is_empty() {
         return Err(Error::Invalid("--sizes is empty".into()));
@@ -801,7 +803,7 @@ fn parse_sizes(spec: &str) -> Result<Vec<usize>> {
 
 /// one size token: plain bytes ("4096") or with a binary suffix ("4k"/"1m"/"2g",
 /// case-insensitive); 0 and anything above the u32 sge length limit rejected
-fn parse_one_size(tok: &str) -> Result<usize> {
+fn parse_one_size(tok: &str, what: &str) -> Result<usize> {
     let tok = tok.trim();
     let (num, mult) = match tok.as_bytes().last() {
         Some(b'k' | b'K') => (&tok[..tok.len() - 1], 1 << 10),
@@ -810,15 +812,21 @@ fn parse_one_size(tok: &str) -> Result<usize> {
         _ => (tok, 1),
     };
     let n: usize =
-        num.parse().map_err(|_| Error::Invalid(format!("bad size '{tok}' in --sizes")))?;
+        num.parse().map_err(|_| Error::Invalid(format!("bad size '{tok}' in {what}")))?;
     let n = n.checked_mul(mult).ok_or_else(|| Error::Invalid(format!("size '{tok}' overflows")))?;
     if n == 0 {
-        return Err(Error::Invalid("--sizes contains 0".into()));
+        return Err(Error::Invalid(format!("{what} contains 0")));
     }
     if n > u32::MAX as usize {
-        return Err(Error::Invalid(format!("size {n} exceeds the u32 sge length limit")));
+        return Err(Error::Invalid(format!("size {n} in {what} exceeds the u32 sge length limit")));
     }
     Ok(n)
+}
+
+/// clap value parser for --buf-len: the same tokens as --sizes entries
+/// ("512m" reads better than 536870912)
+fn parse_buf_len(s: &str) -> std::result::Result<usize, String> {
+    parse_one_size(s, "--buf-len").map_err(|e| e.to_string())
 }
 
 /// serve-side buffer size: explicit --buf-len wins, else the max of --sizes
@@ -1140,6 +1148,15 @@ mod tests {
         assert_eq!(resolve_buf_len(None, Some("1k,2m")).unwrap(), 2 << 20);
         assert!(resolve_buf_len(Some(0), None).is_err());
         assert!(resolve_buf_len(None, Some("junk")).is_err());
+    }
+
+    #[test]
+    fn buf_len_suffix_parse() {
+        assert_eq!(parse_buf_len("512m").unwrap(), 512 << 20);
+        assert_eq!(parse_buf_len("268435456").unwrap(), 268435456);
+        assert_eq!(parse_buf_len("1G").unwrap(), 1 << 30);
+        assert!(parse_buf_len("512x").is_err());
+        assert!(parse_buf_len("0").is_err()); /* "--buf-len contains 0" */
     }
 
     #[test]

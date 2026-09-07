@@ -41,9 +41,10 @@ cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
 cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
                             # targets are compiled but not run by plain
                             # `cargo test`)
-cargo test --example read_bench  # +7 (descriptor round-trip copy, size-list
-                            # parse x2, serve buf sizing, latency percentile
-                            # stats, bandwidth stats math, slot cycling)
+cargo test --example read_bench  # +8 (descriptor round-trip copy, size-list
+                            # parse x2, serve buf sizing + buf-len suffix
+                            # parse, latency percentile stats, bandwidth
+                            # stats math, slot cycling)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e

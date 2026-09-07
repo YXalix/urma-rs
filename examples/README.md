@@ -15,7 +15,7 @@ logic testing without a URMA device.
 | `urma_lookup` | record directory: HTTP-only master assigns id ranges, clients fetch records from each other P2P | one-sided READ; data plane bypasses the master |
 | `list_devices` | prints URMA device names, one per line | probe tool (`urma_get_device_list`), exit 0 iff a device exists; `--caps` appends each device's supported communication-mode matrix (`urma_query_device`) |
 | `urma_cli` | minimal pure-URMA CLI, the single-file usage example of the whole API | `list [--caps]` device probe, `serve`/`read` one-sided READ where the descriptor travels by manual copy-paste (no HTTP control plane at all); `--mode`/`--tp` select any advertised communication combination, both sides must agree |
-| `read_lat` | READ-latency benchmark: URMA one-sided READ vs TCP, swept over message sizes | URMA: `post_read` + busy-polled completion (server CPU uninvolved); TCP has no one-sided op, so a read is emulated as a 4-byte length request + N-byte response round trip (TCP_NODELAY on both ends); per size one verify pass + warmup + timed iters, reported as min/p50/avg/p99/max (`--csv` for machine-readable rows); same pure-std style as `urma_cli` |
+| `read_bench` | READ-latency/bandwidth benchmark: URMA one-sided READ vs TCP, swept over message sizes | URMA: `post_read` + busy-polled completion (server CPU uninvolved); TCP has no one-sided op, so a read is emulated as a 4-byte length request + N-byte response round trip (TCP_NODELAY on both ends); per size one verify pass + warmup + timed iters, reported as min/p50/avg/p99/max (`--csv` for machine-readable rows); `read-urma --depth N>1` switches to a pipelined bandwidth measurement (avg/peak MiB/s + Mops, urma_perftest read_bw's columns); same pure-std style as `urma_cli` |
 
 ## Conventions
 
@@ -37,7 +37,7 @@ logic testing without a URMA device.
 - **Memory layout** (hello/pingpong): `[0, MSG_SIZE)` is the published
   message the peer may read at any time; `[SCRATCH_OFF, +MSG_SIZE)` is the
   landing buffer for incoming data. The two must never overlap.
-- Default ports: hello 13857, lookup 13858, pingpong 13859, read_lat
+- Default ports: hello 13857, lookup 13858, pingpong 13859, read_bench
   13860 (its TCP reference plane; the URMA side has no port — the
   descriptor travels by copy-paste like `urma_cli`'s).
 - The Args/validate/run/combined skeleton is deliberately duplicated
@@ -50,7 +50,7 @@ cargo build --examples
 ./scripts/test_hello.sh      # urma_hello, two local processes
 ./scripts/test_pingpong.sh   # urma_pingpong
 ./scripts/test_local.sh 3 2  # urma_lookup: master + 3 clients x 2 records
-./scripts/test_readlat.sh    # read_lat: TCP loopback latency table (real
+./scripts/test_readbench.sh  # read_bench: TCP loopback benchmark table (real
                              # sockets, no device involved)
 ```
 
@@ -126,9 +126,9 @@ common flags: `-d/--dev` device, `-i/--peer-ip` / `-m/--master-ip` peer,
 `-T/--tcp-hook` emulated data plane, `-p/-P` connect/listen ports,
 `-n/--name` identity in messages.
 
-## Latency benchmark: read_lat
+## Latency / bandwidth benchmark: read_bench
 
-`read_lat` compares URMA one-sided READ latency against TCP over the same
+`read_bench` compares URMA one-sided READ latency against TCP over the same
 size sweep. TCP cannot do one-sided I/O, so its "read" is the standard
 request/response emulation (4-byte length request → N-byte response, one
 RTT per op, TCP_NODELAY forced); URMA measures the real one-sided READ
@@ -140,20 +140,38 @@ are skipped with a note. Run it between the same pair of machines:
 
 ```bash
 # TCP reference over the IP fabric:
-nodeA$ cargo run --example read_lat -- serve-tcp
-nodeB$ cargo run --example read_lat -- read-tcp --addr <ipA>
+nodeA$ cargo run --example read_bench -- serve-tcp
+nodeB$ cargo run --example read_bench -- read-tcp --addr <ipA>
 
 # URMA over the UB fabric (descriptor by copy-paste, like urma_cli);
 # serve sizes its segment to the sweep's maximum, so the sides cannot drift:
-nodeA$ cargo run --example read_lat -- serve-urma -d bonding_dev_0 --sizes 8..16m
-nodeB$ cargo run --example read_lat -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
+nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 8..16m
+nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
         --sizes 8..16m
+
+# URMA READ bandwidth: same serve side, reader pipelines --depth READs:
+nodeA$ cargo run --example read_bench -- serve-urma -d bonding_dev_0 --sizes 4k..1m
+nodeB$ cargo run --example read_bench -- read-urma -d bonding_dev_0 '<the [desc] hex line>' \
+        --sizes 4k..1m --depth 32
 ```
 
 `--sizes` (comma list `8,64,1k` or doubling range `8..16m`, k/m/g
 suffixes allowed), `--iters`, `--warmup`, `--csv` control the sweep —
 the serve subcommands accept `--sizes` too and size their buffer to its
 maximum, so no manual `--buf-len` bookkeeping is needed;
-`scripts/test_readlat.sh` runs the whole matrix (local TCP loopback
+`scripts/test_readbench.sh` runs the whole matrix (local TCP loopback
 always, both transports across a `UB_NODES` pair) and prints the two
 tables side by side.
+
+`read-urma --depth N` (default 1) turns the URMA side into a bandwidth
+measurement in urma_perftest read_bw's style: up to N (≤ 64, the
+jetty/CQ depth) READs in flight, post-one/reap-one, landing offsets
+cycled through the buffer's disjoint windows (past the window count the
+in-flight READs overlap — identical source bytes, and the timed loop
+never checks data; the verify pass stays serialized). Each size then
+reports average BW over the whole first-post→last-completion window,
+peak BW from the fastest single post→completion, and Mops instead of
+latency percentiles; the `--csv` schema changes accordingly
+(`bw_avg_mib,bw_peak_mib,mops`). TCP stays at depth 1 by construction —
+a request/response pair cannot pipeline, which is itself the semantic
+gap.

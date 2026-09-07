@@ -15,12 +15,14 @@ plus example demos.
   pure-URMA CLI, the single-file usage example of the whole API: `list
   [--caps]` probe plus `serve`/`read` manual copy-paste READ with
   `--mode`/`--tp` communication-mode selection — no HTTP control plane, no
-  tokio/serde, and deliberately no `common/mod.rs` include), `read_lat`
-  (READ-latency benchmark in the same pure-std style: URMA one-sided READ
-  vs the TCP request/response emulation over a size sweep —
+  tokio/serde, and deliberately no `common/mod.rs` include), `read_bench`
+  (READ-latency/bandwidth benchmark in the same pure-std style: URMA
+  one-sided READ vs the TCP request/response emulation over a size sweep —
   `serve-urma`/`read-urma` + `serve-tcp`/`read-tcp`, per-size verify pass +
   warmup + timed iters, busy-poll of the CQ, never `wait_read`'s 100ms
-  sleep poll); shared helpers
+  sleep poll; `read-urma --depth N>1` switches the URMA side to a
+  pipelined bandwidth measurement — up to N outstanding READs, perftest
+  read_bw-style avg/peak MiB/s + Mops columns); shared helpers
   in `examples/common/mod.rs` (pulled in via `#[path]`).
 - `scripts/` — local and real-device test entry points.
 - `docs/urma.md` — URMA background concepts (resource model, transport
@@ -35,13 +37,14 @@ cargo test                  # 7 guard tests (5 ffi ABI layout + Urma::init
 cargo test --example urma_cli  # +1 wire-descriptor hex round-trip (example
                             # targets are compiled but not run by plain
                             # `cargo test`)
-cargo test --example read_lat  # +3 (descriptor round-trip copy, size-list
-                            # parse, latency percentile stats)
+cargo test --example read_bench  # +7 (descriptor round-trip copy, size-list
+                            # parse x2, serve buf sizing, latency percentile
+                            # stats, bandwidth stats math, slot cycling)
 cargo clippy --examples
 ./scripts/test_hello.sh     # local e2e, tcp-hook mode (no device needed)
 ./scripts/test_pingpong.sh  # local e2e
 ./scripts/test_local.sh 3 2 # lookup: master + 3 clients x 2 records
-./scripts/test_readlat.sh  # read_lat benchmark: TCP loopback always; with
+./scripts/test_readbench.sh  # read_bench benchmark: TCP loopback always; with
                             # UB_NODES also cross-node TCP + URMA READ matrix
 ./scripts/test_ub.sh        # two-node UB e2e over ssh; needs
                             # UB_NODES="ipA ipB" (or scripts/ub_nodes.txt),

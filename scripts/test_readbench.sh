@@ -1,12 +1,14 @@
 #!/bin/bash
-# read_lat runner: TCP-vs-URMA READ-semantics latency over a size sweep.
+# read_bench runner: TCP-vs-URMA READ-semantics latency/bandwidth over a
+# size sweep (DEPTH=1 latency tables by default; DEPTH>1 the URMA bandwidth
+# table).
 #
 # Part 1 (always runs, no URMA device needed): TCP request/response loopback
 # on this machine — a smoke test of the protocol, pattern verification and
 # the stats path.
 #
 # Part 2 (only with a two-node list, same config as test_ub.sh): deploy the
-# read_lat binary to both nodes and run the full matrix between the SAME
+# read_bench binary to both nodes and run the full matrix between the SAME
 # pair of machines so the two tables are comparable:
 #   a) TCP:  serve-tcp on nodeA, read-tcp from nodeB (over the IP fabric)
 #   b) URMA: serve-urma on nodeA, read-urma from nodeB via the pasted
@@ -16,6 +18,8 @@
 # Env knobs (passed to both sides):
 #   SIZES / ITERS / WARMUP  benchmark knobs, passed to readers AND serves
 #                           (SIZES also sizes the serve-side buffer to its max)
+#   DEPTH                   read-urma --depth: 1 = latency table (default),
+#                           >1 = the pipelined bandwidth table instead
 #   BUFLEN                  explicit serve-side buffer bytes (rarely needed)
 #   PORT                    TCP port (default 13860)
 #   DEV / DEV_A / DEV_B     URMA device per node (default: probe via
@@ -25,12 +29,13 @@ set -u
 cd "$(dirname "$0")/.."
 
 cargo build --examples || exit 1
-BIN=./target/debug/examples/read_lat
+BIN=./target/debug/examples/read_bench
 
 BENCH=()
 [ -n "${SIZES:-}" ]   && BENCH+=(--sizes "$SIZES")
 [ -n "${ITERS:-}" ]   && BENCH+=(--iters "$ITERS")
 [ -n "${WARMUP:-}" ] && BENCH+=(--warmup "$WARMUP")
+DEPTH=${DEPTH:-1}   # read-urma only: >1 runs the bandwidth table
 PORT=${PORT:-13860}
 TMO=${TMO:-120}
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
@@ -51,17 +56,17 @@ wait_for_line() { # <logfile> <fixed string> <max-seconds>
 }
 
 # --- 1) local TCP loopback (no device needed) --------------------------------
-echo "== read_lat: tcp loopback (127.0.0.1) =="
-LOG=$(mktemp /tmp/read_lat.local.XXXXXX.log)
+echo "== read_bench: tcp loopback (127.0.0.1) =="
+LOG=$(mktemp /tmp/read_bench.local.XXXXXX.log)
 "$BIN" serve-tcp --port "$PORT" "${SRV[@]}" >/dev/null 2>&1 &
 SRV=$!
 "$BIN" read-tcp --addr 127.0.0.1 --port "$PORT" "${BENCH[@]}" | tee "$LOG"
 kill "$SRV" 2>/dev/null
 wait "$SRV" 2>/dev/null
 if grep -qF '[read-tcp] done:' "$LOG"; then
-    echo "PASS: read_lat tcp loopback"
+    echo "PASS: read_bench tcp loopback"
 else
-    echo "FAIL: read_lat tcp loopback (no done line; log $LOG)"
+    echo "FAIL: read_bench tcp loopback (no done line; log $LOG)"
     FAIL=1
 fi
 rm -f "$LOG"
@@ -90,7 +95,7 @@ deploy() {  # <node> -> remote dir on stdout
     local rdir
     rdir=$(ssh $SSH_OPTS "$1" "mktemp -d /tmp/urma_rs_rl.XXXXXX") || return 1
     local b
-    for b in read_lat list_devices; do
+    for b in read_bench list_devices; do
         # shellcheck disable=SC2086
         scp $SSH_OPTS -q "target/debug/examples/$b" "$1:$rdir/" || return 1
     done
@@ -99,7 +104,7 @@ deploy() {  # <node> -> remote dir on stdout
 RDIR_A=$(deploy "$A") || { echo "FAIL: cannot deploy to $A (ssh/scp)"; exit 1; }
 RDIR_B=$(deploy "$B") || { echo "FAIL: cannot deploy to $B (ssh/scp)"; exit 1; }
 
-LOGDIR=$(mktemp -d /tmp/read_lat.nodes.XXXXXX)
+LOGDIR=$(mktemp -d /tmp/read_bench.nodes.XXXXXX)
 cleanup() {
     rm -rf "$LOGDIR"
     # shellcheck disable=SC2086
@@ -116,11 +121,11 @@ run_node() {  # <node> <rdir> <logfile> <cmd...>
 }
 
 # --- 2a) TCP across the nodes -------------------------------------------------
-echo "== read_lat: tcp across nodes ($B -> $IP_A) =="
-run_node "$A" "$RDIR_A" tcp.serve.log read_lat serve-tcp --port "$PORT" "${SRV[@]}" &
+echo "== read_bench: tcp across nodes ($B -> $IP_A) =="
+run_node "$A" "$RDIR_A" tcp.serve.log read_bench serve-tcp --port "$PORT" "${SRV[@]}" &
 PA=$!
 if wait_for_line "$LOGDIR/tcp.serve.log" "listening on" 15; then
-    run_node "$B" "$RDIR_B" tcp.read.log read_lat read-tcp --addr "$IP_A" --port "$PORT" "${BENCH[@]}"
+    run_node "$B" "$RDIR_B" tcp.read.log read_bench read-tcp --addr "$IP_A" --port "$PORT" "${BENCH[@]}"
     grep -qF '[read-tcp] done:' "$LOGDIR/tcp.read.log" || { echo "MISSING: read-tcp done line"; FAIL=1; }
 else
     echo "FAIL: serve-tcp on $A never listened (see $LOGDIR/tcp.serve.log)"
@@ -138,8 +143,8 @@ DEV_A=${DEV_A:-${DEV:-$(probe_dev "$A" "$RDIR_A")}}
 DEV_B=${DEV_B:-${DEV:-$(probe_dev "$B" "$RDIR_B")}}
 
 if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
-    echo "== read_lat: urma across nodes ($B reads $A; devices $DEV_A / $DEV_B) =="
-    run_node "$A" "$RDIR_A" urma.serve.log read_lat serve-urma -d "$DEV_A" "${SRV[@]}" &
+    echo "== read_bench: urma across nodes ($B reads $A; devices $DEV_A / $DEV_B) =="
+    run_node "$A" "$RDIR_A" urma.serve.log read_bench serve-urma -d "$DEV_A" "${SRV[@]}" &
     PS=$!
     # serve-urma prints the descriptor as one hex line once its resources are
     # up; play the human: grab it from the log and pass it to nodeB's reader
@@ -153,7 +158,7 @@ if [ -n "$DEV_A" ] && [ -n "$DEV_B" ]; then
         echo "MISSING: no [desc] line from serve-urma on $A (see $LOGDIR/urma.serve.log)"
         FAIL=1
     else
-        run_node "$B" "$RDIR_B" urma.read.log read_lat read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}"
+        run_node "$B" "$RDIR_B" urma.read.log read_bench read-urma -d "$DEV_B" "$DESC" "${BENCH[@]}" --depth "$DEPTH"
         grep -qF '[read-urma] done:' "$LOGDIR/urma.read.log" || { echo "MISSING: read-urma done line"; FAIL=1; }
     fi
     kill "$PS" 2>/dev/null
@@ -167,11 +172,11 @@ echo "---- nodeB tcp table ----"
 sed -n '/== tcp READ latency/,$p' "$LOGDIR/tcp.read.log" 2>/dev/null
 if [ -f "$LOGDIR/urma.read.log" ]; then
     echo "---- nodeB urma table ----"
-    sed -n '/== urma READ latency/,$p' "$LOGDIR/urma.read.log" 2>/dev/null
+    sed -n '/== urma READ/,$p' "$LOGDIR/urma.read.log" 2>/dev/null
 fi
 
 if [ "$FAIL" -eq 0 ]; then
-    echo "PASS: read_lat matrix (tcp loopback + cross-node tcp$( [ -f "$LOGDIR/urma.read.log" ] && echo ' + urma' ))"
+    echo "PASS: read_bench matrix (tcp loopback + cross-node tcp$( [ -f "$LOGDIR/urma.read.log" ] && echo ' + urma' ))"
 else
     echo "FAIL: logs kept in $LOGDIR (rerun to regenerate)"
     trap - EXIT
